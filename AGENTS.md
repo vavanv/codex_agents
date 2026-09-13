@@ -1,4 +1,4 @@
-# Hybrid Workflow Instructions
+# Codex Multi-Agent Workflow Instructions
 
 Use `CODEX_WORKFLOW.md` and the files under `rules/` as the operating contract for work in this repository.
 
