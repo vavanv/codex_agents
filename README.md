@@ -9,7 +9,7 @@ Contract-first workflow for using Codex with bounded specialist agents. The inst
 - [CODEX_WORKFLOW.md](CODEX_WORKFLOW.md) — workflow contract.
 - [rules/](rules/) — routing, validation, escalation, and Git-safety rules.
 - [agents/](agents/) — nine opt-in custom-agent definitions.
-- [plan_toml.md](plan_toml.md) — implementation plan and milestone status.
+- [plan/plan_validated_implementation.md](plan/plan_validated_implementation.md) — current implementation and release status.
 
 If this file conflicts with the detailed guide, follow `WORK_FLOW.md` for installation and lifecycle steps and `CODEX_WORKFLOW.md` for workflow semantics.
 
@@ -17,8 +17,8 @@ If this file conflicts with the detailed guide, follow `WORK_FLOW.md` for instal
 
 - Installation is contracts-only by default.
 - `--with-custom-agents` (PowerShell: `-WithCustomAgents`) additionally installs the nine TOML definitions under the target project's `.codex/agents/`.
-- The validated baseline is Codex CLI `0.154.0`; Python 3.11+ is required for custom-agent validation and installation.
-- Static schema and transactional lifecycle checks are covered. Live discovery, model execution, and behavioral permission enforcement remain separate validation gates.
+- Codex CLI `0.154.0` is the statically supported compatibility-registry version; `runtimeValidated` remains `false`. Python 3.11+ is required for custom-agent validation and installation.
+- As of 2026-09-14, deterministic V0a/V1 checks passed (36 lifecycle/recovery, 58 focused, and 64 full-suite tests) and independent review returned `APPROVE`. V0b is blocked on the Windows TOCTOU limitation; V2–V5 are not started, so overall live validation is `NOT READY`.
 - Legacy `hybrid` names in state, markers, and compatibility identifiers are retained for existing installations; they are not the product branding.
 
 ## Prerequisites
@@ -66,7 +66,7 @@ python .\scripts\validate_agent_configs.py --codex-version 0.154.0
 python .\scripts\verify_agent_runtime.py --target "C:\path\to\your-project"
 ```
 
-The first command validates all nine TOMLs. The second checks an installed catalog and reports live discovery as unverified unless `--run-codex` is explicitly requested. For instruction-discovery and routing smoke tests, follow the validation checklist in [WORK_FLOW.md](WORK_FLOW.md).
+The first command validates all nine TOMLs. The second may return overall `PASS` for matching installed files while discovery remains `UNVERIFIED`. Adding `--run-codex` runs a diagnostic probe, but its current unvalidated event adapter still returns overall/discovery `UNVERIFIED` with exit code 3 and cannot establish runtime PASS. For instruction-discovery and routing smoke tests, follow the validation checklist in [WORK_FLOW.md](WORK_FLOW.md).
 
 ## Uninstall
 
@@ -96,4 +96,4 @@ Installation is project-scoped and idempotent. Existing unmanaged files are not 
 
 ## Scope and limitations
 
-Agent sandbox and model settings are defaults subject to the parent Codex session's controls, not an independent security boundary. The workflow does not authorize commits, pushes, deployments, credential changes, or production-data changes by itself. See [WORK_FLOW.md](WORK_FLOW.md) and the rule documents for the complete safety and recovery behavior.
+Agent sandbox and model settings are defaults subject to the parent Codex session's controls, not an independent security boundary. Existing symlink, junction, and reparse-point ancestors are rejected, but pathname-based checks do not close an adversarial concurrent Windows ancestor-swap TOCTOU race; use only a trusted local filesystem until a reviewed handle-relative backend or threat-model decision resolves V0b. The workflow does not authorize commits, pushes, deployments, credential changes, or production-data changes by itself. See [WORK_FLOW.md](WORK_FLOW.md) and the rule documents for the complete safety and recovery behavior.

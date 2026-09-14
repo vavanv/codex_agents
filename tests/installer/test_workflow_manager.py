@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 import json
+import shutil
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -44,6 +45,13 @@ class WorkflowManagerTests(unittest.TestCase):
         state = json.loads(state_path.read_text(encoding="utf-8"))
         state["agents"]["blockHash"] = manager._text_hash(extracted[2])
         state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def copy_install_sources(self, destination: Path) -> None:
+        for relative in list(manager.PACKAGE_FILES) + list(manager.PROJECT_TEMPLATE_FILES):
+            source = REPOSITORY_ROOT / relative
+            copied = destination / relative
+            copied.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, copied)
 
     def test_dry_run_does_not_write(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -238,6 +246,101 @@ class WorkflowManagerTests(unittest.TestCase):
             self.assertTrue(agent_path.is_file())
             self.assertIn("Project customization", agent_path.read_text(encoding="utf-8"))
             self.assertTrue((target / manager.STATE_FILENAME).is_file())
+
+    def test_forged_state_is_rejected_before_install_or_uninstall_mutation(self) -> None:
+        mutations = (
+            lambda value: value.update({"unexpected": True}),
+            lambda value: value["files"].update(
+                {"project-owned.txt": next(iter(value["files"].values()))}
+            ),
+            lambda value: value["createdDirectories"].append("project-owned-directory"),
+            lambda value: value["backups"].append(
+                f"{manager.BACKUP_DIRECTORY}/{'f' * 32}/AGENTS.md"
+            ),
+            lambda value: value["features"].update(
+                {"customAgents": not value["features"]["customAgents"]}
+            ),
+            lambda value: value["agents"].update({"path": "project-owned.txt"}),
+        )
+        for index, mutate in enumerate(mutations):
+            for operation in ("install", "uninstall"):
+                with self.subTest(index=index, operation=operation):
+                    with tempfile.TemporaryDirectory() as directory:
+                        target = Path(directory)
+                        self.install(target)
+                        sentinel = target / "project-owned.txt"
+                        sentinel.write_bytes(b"safe")
+                        protected_directory = target / "project-owned-directory"
+                        protected_directory.mkdir()
+                        state_path = target / manager.STATE_FILENAME
+                        state = json.loads(state_path.read_text(encoding="utf-8"))
+                        mutate(state)
+                        state_path.write_text(json.dumps(state), encoding="utf-8")
+                        forged_state = state_path.read_bytes()
+
+                        with self.assertRaises(manager.WorkflowError):
+                            if operation == "install":
+                                self.install(target)
+                            else:
+                                self.uninstall(target)
+
+                        self.assertEqual(b"safe", sentinel.read_bytes())
+                        self.assertTrue(protected_directory.is_dir())
+                        self.assertEqual(forged_state, state_path.read_bytes())
+
+    def test_two_content_changing_reinstalls_keep_backup_references_coherent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            source_root = root / "source"
+            target.mkdir()
+            self.copy_install_sources(source_root)
+            with patch.object(manager, "_validate_codex_version", return_value="0.154.0"):
+                with redirect_stdout(StringIO()):
+                    manager.install(target, source_root, False)
+                package_source = source_root / "CODEX_WORKFLOW.md"
+                for revision in ("first", "second"):
+                    package_source.write_text(
+                        package_source.read_text(encoding="utf-8")
+                        + f"\n{revision} revision\n",
+                        encoding="utf-8",
+                    )
+                    with redirect_stdout(StringIO()):
+                        manager.install(target, source_root, False)
+                    state = manager._read_state(target / manager.STATE_FILENAME)
+                    self.assertIsNotNone(state)
+                    referenced = {
+                        record["backup"]
+                        for record in state["files"].values()
+                        if record.get("backup") is not None
+                    }
+                    if state["agents"] and state["agents"].get("backup") is not None:
+                        referenced.add(state["agents"]["backup"])
+                    self.assertEqual(referenced, set(state["backups"]))
+                with redirect_stdout(StringIO()):
+                    manager.install(target, source_root, True)
+
+    def test_partial_uninstall_restores_existing_agents_and_emits_valid_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            original_agents = "# Existing project instructions\n"
+            (target / "AGENTS.md").write_text(original_agents, encoding="utf-8")
+            self.install(target)
+            modified = target / "docs" / "ai" / "PROJECT_CONTEXT.md"
+            modified.write_text(
+                modified.read_text(encoding="utf-8") + "\nProject-owned edit.\n",
+                encoding="utf-8",
+            )
+
+            self.uninstall(target)
+
+            self.assertEqual(original_agents, (target / "AGENTS.md").read_text(encoding="utf-8"))
+            state = manager._read_state(target / manager.STATE_FILENAME)
+            self.assertIsNotNone(state)
+            self.assertIsNone(state["agents"])
+            self.assertEqual([], state["backups"])
+            with redirect_stdout(StringIO()):
+                manager.uninstall(target, True)
 
 
 if __name__ == "__main__":

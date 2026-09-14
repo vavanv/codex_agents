@@ -17,11 +17,11 @@ It provides:
 - SHA-256 tracking of managed files;
 - rollback for interrupted operations;
 - an opt-in catalog of nine project-level custom agents;
-- offline TOML/schema validation and optional live discovery verification.
+- offline TOML/schema validation and optional live discovery diagnostics.
 
 Contracts-only installation remains the default. Pass `-WithCustomAgents` on Windows or `--with-custom-agents` on Linux/macOS to validate and install `.codex/agents/*.toml` for the explorer, implementers, architects, escalation agent, validator, reviewer, and commit-pusher roles.
 
-Custom agents remain opt-in because the committed compatibility registry currently supports only Codex CLI `0.154.0` and records live runtime behavior as not yet validated. Role isolation is also a layered guardrail, not an immutable security boundary: parent-session settings can override agent defaults, and filesystem read-only mode alone cannot prevent every external side effect.
+Custom agents remain opt-in because Codex CLI `0.154.0` is the statically supported compatibility-registry version and `runtimeValidated` remains `false`. Role isolation is also a layered guardrail, not an immutable security boundary: parent-session settings can override agent defaults, and filesystem read-only mode alone cannot prevent every external side effect.
 
 With custom agents installed:
 
@@ -29,10 +29,12 @@ With custom agents installed:
 - explorer, architect, validator, and reviewer TOMLs default to `read-only`;
 - implementers, escalation, and commit-pusher default to `workspace-write` but remain restricted by ownership and authorization instructions;
 - the root still owns routing, execution state, integration, and final evidence;
-- static checks prove file/schema consistency, while the optional live verifier checks discovery separately;
+- static checks prove file/schema consistency, while the optional live diagnostic only collects candidate discovery evidence and cannot currently certify runtime discovery;
 - behavioral permission claims remain unproven until the full disposable-project matrix is run and reviewed.
 
 Installation, update, recovery, and uninstall remain project-scoped. No global Codex agent configuration is added or replaced, and a conflicting unmanaged project agent causes a fail-closed result before writes.
+
+Deterministic status as of **2026-09-14**: V0a is complete and V1's fail-closed deterministic behavior is complete; 36 lifecycle/recovery tests, 58 focused tests, and 64 full-suite tests passed, and independent review returned `APPROVE`. V0b is blocked by the Windows ancestor-swap TOCTOU limitation. Live V1 behavior remains unverified, V2–V5 are not started, and overall live validation is **NOT READY**. See the [current implementation and release status](plan/plan_validated_implementation.md).
 
 ## Installation scope
 
@@ -62,7 +64,7 @@ Before installation, confirm:
 2. The target project directory already exists.
 3. Python 3 is available; Python 3.11 or newer is required when installing custom agents.
 4. Codex CLI is available on `PATH`.
-5. Codex CLI reports version `0.154.0`, the currently validated version.
+5. Codex CLI reports version `0.154.0`, the currently statically supported compatibility-registry version.
 6. You have permission to write to the target project.
 
 Windows PowerShell checks:
@@ -213,14 +215,15 @@ Installation follows these steps in order:
 11. It calculates SHA-256 hashes for source and installed files.
 12. It plans new files, safe updates, and files that must be preserved because the user modified them.
 13. It appends or updates one marked block in `AGENTS.md` without replacing surrounding project instructions.
-14. It backs up every existing file that will be changed.
-15. It writes a transaction journal before applying changes.
-16. It applies file changes using same-directory temporary files and atomic replacement.
-17. It updates the journal before each operation so recovery can safely restore interrupted work.
-18. It writes the state manifest last.
-19. It removes the journal only after all operations succeed.
+14. It writes and strictly verifies the transaction journal before creating any durable preparation backup.
+15. It creates required backups and verifies their ownership, paths, and hashes against the journal.
+16. It checkpoints each action as `applying`, performs the change through same-directory temporary files and atomic replacement, verifies the resulting hash, and then checkpoints it as `applied`.
+17. It writes the state manifest last, verifies it, and marks the transaction committed.
+18. It performs committed cleanup; journal and backup cleanup is resumable if interrupted.
 
-If any operation fails, the installer attempts rollback in reverse order. If rollback cannot finish, the journal remains available for explicit recovery.
+On a failure before commit, recovery rolls applied actions back in reverse order using verified evidence. Recovery of a committed transaction never rolls back installed state; it resumes and finishes cleanup. If rollback or cleanup cannot be resolved safely, the journal and supporting evidence remain in place for explicit recovery.
+
+The path checks reject existing symbolic-link, junction, and reparse-point targets and ancestors. They are pathname-based, however, and do not close an adversarial concurrent Windows ancestor-swap TOCTOU race. Until a reviewed handle-relative Win32 backend is implemented or the threat model explicitly accepts this limitation, operate only on a trusted local filesystem and do not claim full adversarial Windows link safety.
 
 ## Files installed in your project
 
@@ -430,13 +433,15 @@ python .\scripts\validate_agent_configs.py --codex-version 0.154.0
 python .\scripts\verify_agent_runtime.py --target "C:\path\to\your-project"
 ```
 
-The first command validates nine source TOMLs. The second compares installed definitions with those sources and reports `RUNTIME DISCOVERY: NOT VERIFIED` unless `--run-codex` is supplied.
+The first command validates nine source TOMLs. The second compares installed definitions with those sources: matching installed content may produce overall `PASS`, while discovery remains `UNVERIFIED` because it was not requested.
 
-For an optional live check in a disposable or non-critical project:
+For an optional live diagnostic in a disposable or non-critical project:
 
 ```powershell
 python .\scripts\verify_agent_runtime.py --target "C:\path\to\your-project" --run-codex --evidence ".\agent-discovery.json"
 ```
+
+`--run-codex` is currently a diagnostic probe, not a runtime certification. Even when Codex launches successfully and emits parseable candidates, the event adapter for `0.154.0` has not been validated against captured lifecycle evidence, so both the overall result and discovery remain `UNVERIFIED`, the command exits 3, and it cannot establish runtime PASS.
 
 ### Verify instruction discovery
 
@@ -477,7 +482,7 @@ The installer updates only files that still match the hashes it previously insta
 
 ## Recover an interrupted operation
 
-Do not delete `.hybrid-codex-workflow-transaction.json`. It tells the manager which operations may have been applied and where backups are stored.
+Do not delete `.hybrid-codex-workflow-transaction.json`. It records action phases, hashes, and verified backups. A noncommitted transaction is recovered by rollback; a committed transaction is recovered by completing cleanup. If recovery cannot safely resolve an item, the journal and evidence are retained.
 
 Preview recovery on Windows:
 
@@ -498,7 +503,7 @@ bash ./install.sh --target "/path/to/your-project" --recover --dry-run
 bash ./install.sh --target "/path/to/your-project" --recover
 ```
 
-The install and uninstall wrappers use the same recovery engine, so either matching wrapper can recover the recorded transaction.
+The install and uninstall wrappers use the same recovery engine, so either wrapper can recover the recorded transaction.
 
 ## Uninstall on Windows
 
@@ -628,7 +633,7 @@ Codex discovers project instructions from the project root toward the current di
 2. Run `scripts/verify_agent_runtime.py` without `--run-codex` to verify installed content.
 3. Confirm the project is trusted; untrusted projects may skip project-scoped `.codex/` configuration.
 4. Start a new session from the target project root.
-5. Run the optional live verifier and inspect its evidence output.
+5. Run the optional `--run-codex` diagnostic and inspect its sanitized evidence output. Expect `UNVERIFIED`/exit 3 while the `0.154.0` event adapter remains unvalidated; this is not runtime PASS.
 
 ## Recommended project adoption sequence
 
@@ -652,5 +657,5 @@ Codex discovers project instructions from the project root toward the current di
 - [rules/GIT_SAFETY.md](rules/GIT_SAFETY.md) defines worktree and publishing safety.
 - [scripts/workflow_manager.py](scripts/workflow_manager.py) implements installation transactions.
 - [scripts/validate_agent_configs.py](scripts/validate_agent_configs.py) validates the versioned TOML catalog.
-- [scripts/verify_agent_runtime.py](scripts/verify_agent_runtime.py) verifies installed content and optional live discovery.
-- [plan_toml.md](plan_toml.md) records the implementation and release gates.
+- [scripts/verify_agent_runtime.py](scripts/verify_agent_runtime.py) verifies installed content and provides the optional live diagnostic probe.
+- [plan/plan_validated_implementation.md](plan/plan_validated_implementation.md) records the current implementation and release status.
