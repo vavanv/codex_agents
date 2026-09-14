@@ -504,6 +504,8 @@ The install and uninstall wrappers use the same recovery engine, so either match
 
 Open PowerShell in the workflow package repository.
 
+Use the PowerShell uninstaller for Windows targets. Do not pass a Windows path such as `C:\path\to\your-project` to `bash ./uninstall.sh`: Bash can consume the backslashes and resolve the target incorrectly. Even a converted `/mnt/c/...` path can fail the manifest safety check when the workflow was installed with a Windows path. Use the same PowerShell environment for uninstall that was used for install.
+
 ### Step 1: Preview uninstall
 
 ```powershell
