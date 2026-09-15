@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -16,10 +18,14 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn, Protocol
 
-SCHEMA = "hybrid-codex-installer/v1"
-JOURNAL_SCHEMA = "hybrid-codex-installer-transaction/v2"
+SCHEMA = "hybrid-codex-installer/v2"
+LEGACY_STATE_SCHEMA = "hybrid-codex-installer/v1"
+JOURNAL_SCHEMA = "hybrid-codex-installer-transaction/v4"
+LEGACY_JOURNAL_SCHEMA = "hybrid-codex-installer-transaction/v3"
+OLDER_JOURNAL_SCHEMA = "hybrid-codex-installer-transaction/v2"
+ROOT_IDENTITY_SCHEMA = "hybrid-codex-repository-root/v1"
 PACKAGE_VERSION = "0.2.0-agents-preview"
 SUPPORTED_CODEX_VERSIONS = {"0.154.0"}
 INSTALL_DIRECTORY = ".codex-workflow"
@@ -98,28 +104,354 @@ class WorkflowError(RuntimeError):
 class Action:
     index: int
     kind: str
-    path: Path
+    path: str
     content: bytes | None = None
-    backup: Path | None = None
+    backup: str | None = None
     created: bool = False
     pre_hash: str | None = None
     post_hash: str | None = None
     backup_hash: str | None = None
     phase: str = "prepared"
 
-    def to_json(self, target: Path) -> dict[str, Any]:
+    def to_json(self) -> dict[str, Any]:
         return {
             "index": self.index,
             "kind": self.kind,
-            "path": _relative(target, self.path),
+            "path": self.path,
             "owner": "workflow-manager",
-            "backup": _relative(target, self.backup) if self.backup else None,
+            "backup": self.backup,
             "created": self.created,
             "preHash": self.pre_hash,
             "postHash": self.post_hash,
             "backupHash": self.backup_hash,
             "phase": self.phase,
         }
+
+
+class RepositoryAdapter(Protocol):
+    """Repository I/O boundary using normalized repository-relative paths."""
+
+    root: Path
+    root_identity: dict[str, str]
+
+    def normalize(self, relative: str) -> str: ...
+
+    def display(self, relative: str) -> Path: ...
+
+    def exists(self, relative: str, require_file: bool = False) -> bool: ...
+
+    def read_bytes(self, relative: str) -> bytes: ...
+
+    def hash_file(self, relative: str) -> str | None: ...
+
+    def mkdir(self, relative: str) -> None: ...
+
+    def atomic_write(self, relative: str, content: bytes) -> None: ...
+
+    def unlink(self, relative: str, missing_ok: bool = False) -> None: ...
+
+    def rmdir(self, relative: str) -> None: ...
+
+    def observe_root_identity(self) -> dict[str, str]: ...
+
+    def close(self) -> None: ...
+
+
+def _normalize_repository_relative(relative: str) -> str:
+    """Validate canonical repository-relative syntax without filesystem access."""
+    if not isinstance(relative, str) or not relative or "\x00" in relative:
+        raise WorkflowError(f"Managed path is not a safe repository-relative path: {relative!r}")
+    if "\\" in relative or relative.startswith("/"):
+        raise WorkflowError(f"Managed path is not a safe repository-relative path: {relative}")
+    if re.match(r"^[A-Za-z]:", relative) is not None:
+        raise WorkflowError(f"Managed path is not a safe repository-relative path: {relative}")
+
+    components = relative.split("/")
+    reserved_device = re.compile(
+        r"(?:con|prn|aux|nul|com[1-9]|lpt[1-9]|conin\$|conout\$)(?:\..*)?",
+        re.IGNORECASE,
+    )
+    for component in components:
+        if component in {"", ".", ".."}:
+            raise WorkflowError(
+                f"Managed path is not a normalized repository-relative path: {relative}"
+            )
+        if component.endswith((".", " ")):
+            raise WorkflowError(
+                f"Managed path has a trailing-dot or trailing-space alias: {relative}"
+            )
+        if ":" in component:
+            raise WorkflowError(f"Managed path contains a Windows stream or drive alias: {relative}")
+        if reserved_device.fullmatch(component) is not None:
+            raise WorkflowError(f"Managed path uses a reserved Windows device name: {relative}")
+    return "/".join(components)
+
+
+class PathRepositoryAdapter:
+    """Current pathname implementation of the repository I/O boundary."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.root_identity = self.observe_root_identity()
+
+    def observe_root_identity(self) -> dict[str, str]:
+        value = os.lstat(self.root)
+        return {
+            "schema": ROOT_IDENTITY_SCHEMA,
+            "platform": sys.platform,
+            "mode": "path-stat",
+            "deviceId": str(value.st_dev),
+            "fileId": str(value.st_ino),
+        }
+
+    def normalize(self, relative: str) -> str:
+        lexical = _normalize_repository_relative(relative)
+        path = _target_path(self.root, lexical)
+        normalized = _relative(self.root, path)
+        if normalized != lexical:
+            raise WorkflowError(
+                f"Managed path is not a normalized repository-relative path: {relative}"
+            )
+        _assert_safe_path(self.root, path)
+        return normalized
+
+    def display(self, relative: str) -> Path:
+        return _target_path(self.root, self.normalize(relative))
+
+    def exists(self, relative: str, require_file: bool = False) -> bool:
+        return _safe_exists(self.root, self.display(relative), require_file=require_file)
+
+    def read_bytes(self, relative: str) -> bytes:
+        return _safe_read_bytes(self.root, self.display(relative))
+
+    def hash_file(self, relative: str) -> str | None:
+        return _current_hash(self.display(relative), self.root)
+
+    def mkdir(self, relative: str) -> None:
+        path = self.display(relative)
+        path.mkdir(parents=True, exist_ok=True)
+        _assert_safe_path(self.root, path)
+
+    def atomic_write(self, relative: str, content: bytes) -> None:
+        _atomic_write_managed(self.root, self.display(relative), content)
+
+    def unlink(self, relative: str, missing_ok: bool = False) -> None:
+        _safe_unlink(self.root, self.display(relative), missing_ok=missing_ok)
+
+    def rmdir(self, relative: str) -> None:
+        _safe_rmdir(self.root, self.display(relative))
+
+    def close(self) -> None:
+        """The pathname backend does not own a persistent resource."""
+
+
+def _load_windows_handle_fs() -> Any:
+    module_name = (
+        f"{__package__}.windows_handle_fs" if __package__ else "windows_handle_fs"
+    )
+    return importlib.import_module(module_name)
+
+
+def _native_error_code(error: BaseException) -> str:
+    winerror = getattr(error, "winerror", None)
+    errno = getattr(error, "errno", None)
+    details = []
+    if isinstance(winerror, int):
+        details.append(f"winerror={winerror}")
+    elif isinstance(errno, int):
+        details.append(f"errno={errno}")
+    for note in getattr(error, "__notes__", ()):
+        match = re.search(r"NTSTATUS=0x[0-9A-Fa-f]{8}", note)
+        if match is not None:
+            details.append(
+                "NTSTATUS=0x" + match.group(0).rsplit("0x", 1)[1].upper()
+            )
+            break
+    return ", ".join(details) if details else type(error).__name__
+
+
+def _raise_native_workflow_error(
+    module: Any,
+    error: BaseException,
+    operation: str,
+    relative: str | None = None,
+) -> NoReturn:
+    location = f" for {relative}" if relative is not None else ""
+    if isinstance(error, module.UnsupportedTargetError):
+        raise WorkflowError(f"Unsupported Windows repository target: {error}") from error
+    if isinstance(error, module.ReparsePointError):
+        raise WorkflowError(
+            f"Refusing Windows repository reparse point while {operation}{location}"
+        ) from error
+    if isinstance(error, module.RepositoryFsError):
+        raise WorkflowError(
+            f"Windows repository backend failed while {operation}{location}: "
+            f"{type(error).__name__}"
+        ) from error
+    if isinstance(error, OSError):
+        raise WorkflowError(
+            f"Windows repository filesystem failed while {operation}{location}: "
+            f"{_native_error_code(error)}"
+        ) from error
+    if isinstance(error, (TypeError, ValueError)):
+        raise WorkflowError(
+            f"Windows repository backend contract failed while {operation}{location}: "
+            f"{type(error).__name__}"
+        ) from error
+    raise error
+
+
+class WindowsRepositoryAdapter:
+    """Repository adapter backed by one pinned native Windows root handle."""
+
+    def __init__(self, root: Path):
+        try:
+            self._module = _load_windows_handle_fs()
+        except (ImportError, OSError) as error:
+            raise WorkflowError(
+                "Windows handle-relative repository backend is unavailable"
+            ) from error
+        self._filesystem = None
+        try:
+            self._filesystem = self._module.RepositoryFs(str(root))
+        except Exception as error:
+            _raise_native_workflow_error(self._module, error, "acquiring repository root")
+        try:
+            self.root = Path(self._filesystem.display_path)
+            self.root_identity = self.observe_root_identity()
+        except BaseException as primary:
+            filesystem = self._filesystem
+            self._filesystem = None
+            if filesystem is not None:
+                try:
+                    filesystem.close()
+                except Exception as cleanup_error:
+                    primary.add_note(
+                        "Windows repository root cleanup failed after acquisition: "
+                        f"{_native_error_code(cleanup_error)}"
+                    )
+            raise
+
+    def normalize(self, relative: str) -> str:
+        return _normalize_repository_relative(relative)
+
+    def display(self, relative: str) -> Path:
+        return _target_path(self.root, self.normalize(relative))
+
+    def _call(self, operation: str, relative: str, callback: Any) -> Any:
+        try:
+            return callback()
+        except Exception as error:
+            _raise_native_workflow_error(
+                self._module, error, operation, self.normalize(relative)
+            )
+
+    def exists(self, relative: str, require_file: bool = False) -> bool:
+        relative = self.normalize(relative)
+        return bool(
+            self._call(
+                "checking existence",
+                relative,
+                lambda: self._filesystem.exists(
+                    relative, directory=False if require_file else None
+                ),
+            )
+        )
+
+    def read_bytes(self, relative: str) -> bytes:
+        relative = self.normalize(relative)
+        return self._call(
+            "reading file", relative, lambda: self._filesystem.read_bytes(relative)
+        )
+
+    def hash_file(self, relative: str) -> str | None:
+        relative = self.normalize(relative)
+        if not self.exists(relative, require_file=True):
+            return None
+        return self._call(
+            "hashing file", relative, lambda: self._filesystem.hash_file(relative)
+        )
+
+    def mkdir(self, relative: str) -> None:
+        relative = self.normalize(relative)
+        self._call(
+            "creating directories",
+            relative,
+            lambda: self._filesystem.ensure_directories(relative),
+        )
+
+    def atomic_write(self, relative: str, content: bytes) -> None:
+        relative = self.normalize(relative)
+        parent = relative.rpartition("/")[0]
+        if parent:
+            self.mkdir(parent)
+        self._call(
+            "atomically writing file",
+            relative,
+            lambda: self._filesystem.atomic_write(relative, content),
+        )
+
+    def unlink(self, relative: str, missing_ok: bool = False) -> None:
+        relative = self.normalize(relative)
+        self._call(
+            "removing file",
+            relative,
+            lambda: self._filesystem.unlink(relative, missing_ok=missing_ok),
+        )
+
+    def rmdir(self, relative: str) -> None:
+        relative = self.normalize(relative)
+        try:
+            self._filesystem.rmdir(relative, missing_ok=True)
+        except OSError as error:
+            if getattr(error, "winerror", None) == 145:
+                return
+            _raise_native_workflow_error(
+                self._module, error, "removing directory", relative
+            )
+        except Exception as error:
+            _raise_native_workflow_error(
+                self._module, error, "removing directory", relative
+            )
+
+    def observe_root_identity(self) -> dict[str, str]:
+        try:
+            identity = self._filesystem.identity
+        except Exception as error:
+            _raise_native_workflow_error(
+                self._module, error, "observing repository root identity"
+            )
+        return {
+            "schema": ROOT_IDENTITY_SCHEMA,
+            "platform": "win32",
+            "mode": "windows-ntfs-handle",
+            "volumeSerialNumber": f"{identity.volume_serial_number:016x}",
+            "fileId": identity.file_id,
+        }
+
+    def close(self) -> None:
+        filesystem = self._filesystem
+        self._filesystem = None
+        if filesystem is None:
+            return
+        try:
+            filesystem.close()
+        except Exception as error:
+            _raise_native_workflow_error(
+                self._module, error, "closing repository root"
+            )
+
+
+def _repository_adapter(target: Path) -> RepositoryAdapter:
+    """Explicit pathname adapter retained for non-CLI compatibility and tests."""
+    return PathRepositoryAdapter(target)
+
+
+def _repository_adapter_from_raw_target(raw_target: str) -> RepositoryAdapter:
+    if os.name == "nt":
+        supplied = Path(raw_target).expanduser().absolute()
+        return WindowsRepositoryAdapter(supplied)
+    return PathRepositoryAdapter(_assert_safe_target(raw_target))
 
 
 def _now() -> str:
@@ -154,6 +486,96 @@ def _is_timestamp(value: Any) -> bool:
 
 def _is_transaction_id(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value) is not None
+
+
+def _is_canonical_unsigned_decimal(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"(?:0|[1-9][0-9]*)", value) is not None
+
+
+def _validate_root_identity(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise WorkflowError("Repository root identity is malformed")
+    mode = value.get("mode")
+    if mode == "path-stat":
+        expected_keys = {"schema", "platform", "mode", "deviceId", "fileId"}
+        if (
+            set(value) != expected_keys
+            or value.get("schema") != ROOT_IDENTITY_SCHEMA
+            or value.get("platform") != sys.platform
+            or not _is_canonical_unsigned_decimal(value.get("deviceId"))
+            or not _is_canonical_unsigned_decimal(value.get("fileId"))
+        ):
+            raise WorkflowError("Repository root identity is malformed")
+    elif mode == "windows-ntfs-handle":
+        expected_keys = {
+            "schema",
+            "platform",
+            "mode",
+            "volumeSerialNumber",
+            "fileId",
+        }
+        if (
+            set(value) != expected_keys
+            or value.get("schema") != ROOT_IDENTITY_SCHEMA
+            or value.get("platform") != "win32"
+            or not isinstance(value.get("volumeSerialNumber"), str)
+            or re.fullmatch(r"[0-9a-f]{16}", value["volumeSerialNumber"]) is None
+            or not isinstance(value.get("fileId"), str)
+            or re.fullmatch(r"[0-9a-f]{32}", value["fileId"]) is None
+        ):
+            raise WorkflowError("Repository root identity is malformed")
+    else:
+        raise WorkflowError("Repository root identity is malformed")
+    return dict(value)
+
+
+def _assert_root_identity_matches(
+    expected: dict[str, str], actual: dict[str, str], context: str
+) -> None:
+    validated_expected = _validate_root_identity(expected)
+    validated_actual = _validate_root_identity(actual)
+    if validated_expected != validated_actual:
+        raise WorkflowError(f"Repository root identity does not match {context}")
+
+
+def _path_stat_identity_matches_windows_handle(
+    expected: dict[str, str], actual: dict[str, str]
+) -> bool:
+    validated_expected = _validate_root_identity(expected)
+    validated_actual = _validate_root_identity(actual)
+    if (
+        validated_expected.get("mode") != "path-stat"
+        or validated_expected.get("platform") != "win32"
+        or validated_actual.get("mode") != "windows-ntfs-handle"
+    ):
+        return False
+    native_file_id = bytes.fromhex(validated_actual["fileId"])
+    return (
+        int(validated_expected["deviceId"])
+        == int(validated_actual["volumeSerialNumber"], 16)
+        and int(validated_expected["fileId"])
+        == int.from_bytes(native_file_id, "little")
+    )
+
+
+def _assert_persisted_root_identity_matches(
+    expected: dict[str, str], actual: dict[str, str], context: str
+) -> None:
+    validated_expected = _validate_root_identity(expected)
+    validated_actual = _validate_root_identity(actual)
+    if validated_expected == validated_actual:
+        return
+    if _path_stat_identity_matches_windows_handle(
+        validated_expected, validated_actual
+    ):
+        return
+    raise WorkflowError(f"Repository root identity does not match {context}")
+
+
+def _assert_current_root_identity(
+    adapter: RepositoryAdapter, expected: dict[str, str], context: str
+) -> None:
+    _assert_root_identity_matches(expected, adapter.observe_root_identity(), context)
 
 
 def _current_hash(path: Path, target: Path | None = None) -> str | None:
@@ -304,23 +726,45 @@ def _write_json(path: Path, value: dict[str, Any], target: Path | None = None) -
         _atomic_write_managed(target, path, content)
 
 
-def _read_state(path: Path, expected_target: Path | None = None) -> dict[str, Any] | None:
+def _read_state(
+    path: Path,
+    expected_target: Path | None = None,
+    adapter: RepositoryAdapter | None = None,
+    expected_root_identity: dict[str, str] | None = None,
+    allow_legacy: bool = False,
+) -> dict[str, Any] | None:
     target = expected_target or path.parent
-    _assert_safe_path(target, path, require_file=True)
-    if _lstat_optional(path) is None:
+    repository = adapter or _repository_adapter(target)
+    relative = repository.normalize(_relative(target, path))
+    if not repository.exists(relative, require_file=True):
         return None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        content = repository.read_bytes(relative).decode("utf-8")
+        value = json.loads(content)
     except (OSError, json.JSONDecodeError) as error:
         raise WorkflowError(f"State manifest is not valid JSON: {path}") from error
-    root_keys = {
+    legacy_root_keys = {
         "schema", "packageVersion", "target", "codexVersion", "files", "agents",
         "backups", "createdDirectories", "features", "installedAt", "updatedAt",
         "transactionId",
     }
-    if not isinstance(value, dict) or set(value) != root_keys:
+    if not isinstance(value, dict):
         raise WorkflowError(f"Unsupported or malformed state manifest: {path}")
-    if value.get("schema") != SCHEMA or value.get("packageVersion") != PACKAGE_VERSION:
+    schema = value.get("schema")
+    if schema == SCHEMA:
+        if set(value) != legacy_root_keys | {"rootIdentity"}:
+            raise WorkflowError(f"Unsupported or malformed state manifest: {path}")
+        state_identity = _validate_root_identity(value.get("rootIdentity"))
+        current_identity = expected_root_identity or repository.root_identity
+        _assert_persisted_root_identity_matches(
+            state_identity, current_identity, "since the state manifest was written"
+        )
+    elif schema == LEGACY_STATE_SCHEMA and allow_legacy:
+        if set(value) != legacy_root_keys:
+            raise WorkflowError(f"Unsupported or malformed state manifest: {path}")
+    else:
+        raise WorkflowError(f"Unsupported or malformed state manifest: {path}")
+    if value.get("packageVersion") != PACKAGE_VERSION:
         raise WorkflowError(f"Unsupported or malformed state manifest: {path}")
     if value.get("codexVersion") not in SUPPORTED_CODEX_VERSIONS:
         raise WorkflowError(f"Unsupported or malformed state manifest: {path}")
@@ -409,6 +853,8 @@ def _read_state(path: Path, expected_target: Path | None = None) -> dict[str, An
             raise WorkflowError(f"Malformed generated AGENTS record in state manifest: {path}")
         agent_backup = agents.get("backup")
         if agent_backup is not None:
+            if not isinstance(agent_backup, str):
+                raise WorkflowError(f"Malformed AGENTS backup in state manifest: {path}")
             parts = Path(agent_backup).parts
             if (
                 "\\" in agent_backup
@@ -459,6 +905,11 @@ def _read_state(path: Path, expected_target: Path | None = None) -> dict[str, An
         or features["customAgents"] != expected_custom_agents
     ):
         raise WorkflowError(f"Malformed features in state manifest: {path}")
+    if schema == LEGACY_STATE_SCHEMA:
+        print(
+            "WARN: legacy installer state v1 was validated and will be migrated "
+            "to state v2 by the next successful write"
+        )
     return value
 
 
@@ -578,12 +1029,23 @@ def _install_agents_content(
 def _prepare_actions(
     target: Path, transaction_id: str, requests: list[tuple[str, Path, bytes | None]]
 ) -> list[Action]:
+    adapter = _repository_adapter(target)
+    relative_requests = [
+        (kind, _relative(target, path), content) for kind, path, content in requests
+    ]
+    return _prepare_relative_actions(adapter, transaction_id, relative_requests)
+
+
+def _prepare_relative_actions(
+    adapter: RepositoryAdapter,
+    transaction_id: str,
+    requests: list[tuple[str, str, bytes | None]],
+) -> list[Action]:
     actions: list[Action] = []
-    transaction_backup = target / BACKUP_DIRECTORY / transaction_id
-    state_indexes = [index for index, (_, path, _) in enumerate(requests) if path == target / STATE_FILENAME]
+    state_indexes = [index for index, (_, path, _) in enumerate(requests) if path == STATE_FILENAME]
     if state_indexes and state_indexes != [len(requests) - 1]:
         raise WorkflowError("State manifest transaction action must be last")
-    seen_paths: set[Path] = set()
+    seen_paths: set[str] = set()
     for index, (kind, path, content) in enumerate(requests):
         if kind not in {"write", "delete"}:
             raise WorkflowError(f"Unknown transaction action: {kind}")
@@ -591,18 +1053,16 @@ def _prepare_actions(
             raise WorkflowError(f"Write action has no content: {path}")
         if kind == "delete" and content is not None:
             raise WorkflowError(f"Delete action unexpectedly has content: {path}")
-        _target_path(target, _relative(target, path))
-        _assert_no_symlink(target, path)
+        path = adapter.normalize(path)
         if path in seen_paths:
             raise WorkflowError(f"Duplicate transaction action path: {path}")
         seen_paths.add(path)
-        pre_hash = _current_hash(path, target)
+        pre_hash = adapter.hash_file(path)
         created = pre_hash is None
         backup = None
         backup_hash = None
         if not created:
-            backup = transaction_backup / _relative(target, path)
-            _assert_no_symlink(target, backup)
+            backup = adapter.normalize(f"{BACKUP_DIRECTORY}/{transaction_id}/{path}")
             backup_hash = pre_hash
         post_hash = _sha256_bytes(content) if content is not None else None
         actions.append(
@@ -619,20 +1079,77 @@ def _prepare_actions(
             )
         )
     for action in actions:
-        if _current_hash(action.path, target) != action.pre_hash:
-            raise WorkflowError(f"Managed file changed while planning transaction: {action.path}")
+        if adapter.hash_file(action.path) != action.pre_hash:
+            raise WorkflowError(
+                f"Managed file changed while planning transaction: {adapter.display(action.path)}"
+            )
     return actions
 
 
-def _prepare_backups(target: Path, actions: list[Action]) -> None:
+def _prepare_backups(
+    adapter: RepositoryAdapter | Path, actions: list[Action]
+) -> None:
+    repository = _repository_adapter(adapter) if isinstance(adapter, Path) else adapter
     for action in actions:
         if action.backup is None:
             continue
-        if _current_hash(action.path, target) != action.pre_hash:
-            raise WorkflowError(f"Managed file changed before backup: {action.path}")
-        _atomic_write_managed(target, action.backup, _safe_read_bytes(target, action.path))
-        if _current_hash(action.backup, target) != action.backup_hash:
-            raise WorkflowError(f"Backup verification failed for: {action.path}")
+        if repository.hash_file(action.path) != action.pre_hash:
+            raise WorkflowError(
+                f"Managed file changed before backup: {repository.display(action.path)}"
+            )
+        repository.atomic_write(action.backup, repository.read_bytes(action.path))
+        if repository.hash_file(action.backup) != action.backup_hash:
+            raise WorkflowError(
+                f"Backup verification failed for: {repository.display(action.path)}"
+            )
+
+
+def _parent_directories(relative: str) -> list[str]:
+    parts = Path(relative).parts[:-1]
+    return [Path(*parts[:index]).as_posix() for index in range(1, len(parts) + 1)]
+
+
+def _eligible_rollback_directories(actions: list[Action]) -> set[str]:
+    eligible: set[str] = set()
+    for action in actions:
+        if action.kind == "write":
+            eligible.update(_parent_directories(action.path))
+        if action.backup is not None:
+            eligible.update(_parent_directories(action.backup))
+    return eligible
+
+
+def _canonical_directory_order(directories: set[str]) -> list[str]:
+    return sorted(directories, key=lambda relative: (len(Path(relative).parts), relative))
+
+
+def _plan_rollback_directories(
+    adapter: RepositoryAdapter, actions: list[Action]
+) -> list[str]:
+    absent: set[str] = set()
+    for relative in _eligible_rollback_directories(actions):
+        normalized = adapter.normalize(relative)
+        if not adapter.exists(normalized):
+            absent.add(normalized)
+    return _canonical_directory_order(absent)
+
+
+def _validate_rollback_directories(
+    adapter: RepositoryAdapter, value: Any, actions: list[Action]
+) -> list[str]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise WorkflowError("Transaction journal rollbackDirectories is malformed")
+    normalized = [adapter.normalize(item) for item in value]
+    if normalized != value or len(normalized) != len(set(normalized)):
+        raise WorkflowError("Transaction journal rollbackDirectories is not canonical")
+    if normalized != _canonical_directory_order(set(normalized)):
+        raise WorkflowError("Transaction journal rollbackDirectories is not canonical")
+    eligible = _eligible_rollback_directories(actions)
+    if any(relative not in eligible for relative in normalized):
+        raise WorkflowError("Transaction journal rollbackDirectories is unrelated to its actions")
+    for relative in normalized:
+        adapter.exists(relative)
+    return normalized
 
 
 def _journal_value(
@@ -642,28 +1159,51 @@ def _journal_value(
     actions: list[Action],
     phase: str = "prepared",
     created_at: str | None = None,
+    root_identity: dict[str, str] | None = None,
+    rollback_directories: list[str] | None = None,
 ) -> dict[str, Any]:
+    identity = root_identity or _repository_adapter(target).root_identity
     return {
         "schema": JOURNAL_SCHEMA,
         "transactionId": transaction_id,
         "operation": operation,
         "target": str(target),
+        "rootIdentity": _validate_root_identity(identity),
         "createdAt": created_at or _now(),
         "phase": phase,
-        "actions": [action.to_json(target) for action in actions],
+        "rollbackDirectories": list(rollback_directories or []),
+        "actions": [action.to_json() for action in actions],
     }
 
 
-def _parse_journal(target: Path, value: Any) -> tuple[str, str, str, str, list[Action]]:
-    root_keys = {"schema", "transactionId", "operation", "target", "createdAt", "phase", "actions"}
+def _parse_journal(
+    target: Path,
+    value: Any,
+    adapter: RepositoryAdapter | None = None,
+    expected_root_identity: dict[str, str] | None = None,
+) -> tuple[str, str, str, str, list[Action], list[str]]:
+    if not isinstance(value, dict):
+        raise WorkflowError("Transaction journal has an incomplete or unknown root schema")
+    if value.get("schema") in {LEGACY_JOURNAL_SCHEMA, OLDER_JOURNAL_SCHEMA}:
+        raise WorkflowError("Legacy transaction journal requires manual recovery")
+    if value.get("schema") != JOURNAL_SCHEMA:
+        raise WorkflowError("Legacy or unsupported transaction journal requires manual recovery")
+    root_keys = {
+        "schema", "transactionId", "operation", "target", "rootIdentity", "createdAt",
+        "phase", "rollbackDirectories", "actions",
+    }
     action_keys = {
         "index", "kind", "path", "owner", "created", "backup", "preHash", "postHash",
         "backupHash", "phase",
     }
-    if not isinstance(value, dict) or set(value) != root_keys:
+    if set(value) != root_keys:
         raise WorkflowError("Transaction journal has an incomplete or unknown root schema")
-    if value.get("schema") != JOURNAL_SCHEMA:
-        raise WorkflowError("Legacy or unsupported transaction journal requires manual recovery")
+    journal_identity = _validate_root_identity(value.get("rootIdentity"))
+    repository = adapter or _repository_adapter(target)
+    current_identity = expected_root_identity or repository.root_identity
+    _assert_persisted_root_identity_matches(
+        journal_identity, current_identity, "since the transaction journal was written"
+    )
     transaction_id = value.get("transactionId")
     if not isinstance(transaction_id, str) or re.fullmatch(r"[0-9a-f]{32}", transaction_id) is None:
         raise WorkflowError("Transaction journal has an invalid transactionId")
@@ -686,7 +1226,7 @@ def _parse_journal(target: Path, value: Any) -> tuple[str, str, str, str, list[A
     if not isinstance(items, list) or not items:
         raise WorkflowError("Transaction journal must contain actions")
     actions: list[Action] = []
-    seen_paths: set[Path] = set()
+    seen_paths: set[str] = set()
     for index, item in enumerate(items):
         if not isinstance(item, dict) or set(item) != action_keys:
             raise WorkflowError("Transaction journal has an incomplete or unknown action schema")
@@ -702,10 +1242,7 @@ def _parse_journal(target: Path, value: Any) -> tuple[str, str, str, str, list[A
             raise WorkflowError("Transaction journal action phase is invalid")
         if not isinstance(relative, str):
             raise WorkflowError("Transaction journal action path is invalid")
-        path = _target_path(target, relative)
-        if _relative(target, path) != relative or "\\" in relative:
-            raise WorkflowError(f"Transaction journal action path is not normalized: {relative}")
-        _assert_no_symlink(target, path)
+        path = repository.normalize(relative)
         if relative not in _managed_action_paths() and not _is_managed_backup_path(relative):
             raise WorkflowError(f"Transaction journal action path is not package-managed: {relative}")
         if path in seen_paths:
@@ -731,10 +1268,7 @@ def _parse_journal(target: Path, value: Any) -> tuple[str, str, str, str, list[A
                 raise WorkflowError(f"Pre-existing action hash metadata is invalid: {relative}")
             if backup_relative != expected_backup:
                 raise WorkflowError(f"Transaction journal backup path is invalid: {relative}")
-            backup = _target_path(target, backup_relative)
-            if _relative(target, backup) != backup_relative or "\\" in backup_relative:
-                raise WorkflowError(f"Transaction journal backup path is not normalized: {relative}")
-            _assert_no_symlink(target, backup)
+            backup = repository.normalize(backup_relative)
         actions.append(
             Action(
                 index=index,
@@ -748,41 +1282,63 @@ def _parse_journal(target: Path, value: Any) -> tuple[str, str, str, str, list[A
                 phase=phase,
             )
         )
-    state_indexes = [action.index for action in actions if action.path == target / STATE_FILENAME]
+    state_indexes = [action.index for action in actions if action.path == STATE_FILENAME]
     if state_indexes and state_indexes != [len(actions) - 1]:
         raise WorkflowError("State manifest transaction action must be last")
-    return transaction_id, operation, created_at, journal_phase, actions
+    rollback_directories = _validate_rollback_directories(
+        repository, value.get("rollbackDirectories"), actions
+    )
+    return (
+        transaction_id,
+        operation,
+        created_at,
+        journal_phase,
+        actions,
+        rollback_directories,
+    )
 
 
-def _read_journal(target: Path, journal_path: Path) -> tuple[str, str, str, str, list[Action]]:
-    _assert_safe_path(target, journal_path, require_file=True)
+def _read_journal(
+    target: Path, journal_path: Path
+) -> tuple[str, str, str, str, list[Action], list[str]]:
+    adapter = _repository_adapter(target)
+    return _read_relative_journal(adapter, _relative(target, journal_path))
+
+
+def _read_relative_journal(
+    adapter: RepositoryAdapter,
+    journal_relative: str,
+    expected_root_identity: dict[str, str] | None = None,
+) -> tuple[str, str, str, str, list[Action], list[str]]:
+    journal_relative = adapter.normalize(journal_relative)
     try:
-        value = json.loads(journal_path.read_text(encoding="utf-8"))
+        value = json.loads(adapter.read_bytes(journal_relative).decode("utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise WorkflowError(
-            f"Cannot recover malformed transaction journal; retain it for manual recovery: {journal_path}"
+            "Cannot recover malformed transaction journal; retain it for manual recovery: "
+            f"{adapter.display(journal_relative)}"
         ) from error
-    return _parse_journal(target, value)
+    return _parse_journal(adapter.root, value, adapter, expected_root_identity)
 
 
-def _classify_actions(target: Path, actions: list[Action]) -> dict[int, str]:
+def _classify_actions(adapter: RepositoryAdapter, actions: list[Action]) -> dict[int, str]:
     classifications: dict[int, str] = {}
     errors: list[str] = []
     for action in actions:
         try:
-            current_hash = _current_hash(action.path, target)
+            current_hash = adapter.hash_file(action.path)
             if (
                 current_hash == action.post_hash
                 and action.backup is not None
-                and _current_hash(action.backup, target) != action.backup_hash
+                and adapter.hash_file(action.backup) != action.backup_hash
             ):
-                errors.append(f"backup is missing or tampered: {action.backup}")
+                errors.append(f"backup is missing or tampered: {adapter.display(action.backup)}")
             if current_hash == action.pre_hash:
                 classifications[action.index] = "pre"
             elif current_hash == action.post_hash:
                 classifications[action.index] = "post"
             else:
-                errors.append(f"intervening content at {action.path}")
+                errors.append(f"intervening content at {adapter.display(action.path)}")
         except (OSError, WorkflowError) as error:
             errors.append(str(error))
     if errors:
@@ -796,67 +1352,171 @@ def _classify_actions(target: Path, actions: list[Action]) -> dict[int, str]:
 def _apply_actions(
     target: Path, journal_path: Path, transaction_id: str, operation: str, actions: list[Action]
 ) -> None:
+    adapter = _repository_adapter(target)
+    _apply_relative_actions(
+        adapter, _relative(target, journal_path), transaction_id, operation, actions
+    )
+
+
+def _apply_relative_actions(
+    adapter: RepositoryAdapter,
+    journal_relative: str,
+    transaction_id: str,
+    operation: str,
+    actions: list[Action],
+) -> None:
     if not actions:
         return
     created_at = _now()
-    _write_json(
-        journal_path,
-        _journal_value(target, transaction_id, operation, actions, "prepared", created_at),
-        target,
+    root_identity = _validate_root_identity(adapter.root_identity)
+    rollback_directories = _plan_rollback_directories(adapter, actions)
+    _write_relative_json(
+        adapter,
+        journal_relative,
+        _journal_value(
+            adapter.root, transaction_id, operation, actions, "prepared", created_at,
+            root_identity, rollback_directories,
+        ),
+        root_identity,
     )
-    parsed_id, parsed_operation, _, _, parsed_actions = _read_journal(target, journal_path)
-    if parsed_id != transaction_id or parsed_operation != operation:
+    (
+        parsed_id,
+        parsed_operation,
+        _,
+        _,
+        parsed_actions,
+        parsed_rollback_directories,
+    ) = _read_relative_journal(
+        adapter, journal_relative, root_identity
+    )
+    if (
+        parsed_id != transaction_id
+        or parsed_operation != operation
+        or parsed_rollback_directories != rollback_directories
+    ):
         raise WorkflowError("Transaction journal verification failed before apply")
-    _prepare_backups(target, actions)
-    _classify_actions(target, parsed_actions)
+    _assert_current_root_identity(adapter, root_identity, "before backup creation")
+    _prepare_backups(adapter, actions)
+    _classify_actions(adapter, parsed_actions)
     try:
         for action in actions:
-            if _current_hash(action.path, target) != action.pre_hash:
-                raise WorkflowError(f"Managed file changed before apply: {action.path}")
+            _assert_current_root_identity(adapter, root_identity, "before applying an action")
+            if adapter.hash_file(action.path) != action.pre_hash:
+                raise WorkflowError(f"Managed file changed before apply: {adapter.display(action.path)}")
             action.phase = "applying"
-            _write_json(
-                journal_path,
-                _journal_value(target, transaction_id, operation, actions, "applying", created_at),
-                target,
-            )
+            _write_relative_json(adapter, journal_relative, _journal_value(
+                adapter.root, transaction_id, operation, actions, "applying", created_at,
+                root_identity, rollback_directories,
+            ), root_identity)
             if action.kind == "write":
                 if action.content is None:
                     raise WorkflowError(f"Write action has no content: {action.path}")
-                _atomic_write_managed(target, action.path, action.content)
+                adapter.atomic_write(action.path, action.content)
             elif action.kind == "delete":
-                _safe_unlink(target, action.path, missing_ok=True)
+                adapter.unlink(action.path, missing_ok=True)
             else:
                 raise WorkflowError(f"Unknown transaction action: {action.kind}")
-            if _current_hash(action.path, target) != action.post_hash:
-                raise WorkflowError(f"Managed file failed post-write verification: {action.path}")
+            if adapter.hash_file(action.path) != action.post_hash:
+                raise WorkflowError(
+                    f"Managed file failed post-write verification: {adapter.display(action.path)}"
+                )
             action.phase = "applied"
-            _write_json(
-                journal_path,
-                _journal_value(target, transaction_id, operation, actions, "applying", created_at),
-                target,
-            )
+            _write_relative_json(adapter, journal_relative, _journal_value(
+                adapter.root, transaction_id, operation, actions, "applying", created_at,
+                root_identity, rollback_directories,
+            ), root_identity)
     except Exception:
         try:
-            _rollback_actions(target, journal_path, transaction_id, operation, created_at, actions)
+            _rollback_relative_actions(
+                adapter,
+                journal_relative,
+                transaction_id,
+                operation,
+                created_at,
+                actions,
+                root_identity,
+                rollback_directories,
+            )
         except Exception as rollback_error:
             raise WorkflowError(
-                f"Transaction failed and automatic rollback is incomplete; journal retained at {journal_path}: "
+                "Transaction failed and automatic rollback is incomplete; journal retained at "
+                f"{adapter.display(journal_relative)}: "
                 f"{rollback_error}"
             ) from rollback_error
-        _safe_unlink(target, journal_path, missing_ok=True)
-        _discard_transaction_backups(target, actions)
+        _complete_rollback_cleanup(
+            adapter,
+            journal_relative,
+            actions,
+            rollback_directories,
+            root_identity,
+        )
         raise
-    _write_json(
-        journal_path,
-        _journal_value(target, transaction_id, operation, actions, "committed", created_at),
-        target,
+    _write_relative_json(adapter, journal_relative, _journal_value(
+        adapter.root, transaction_id, operation, actions, "committed", created_at,
+        root_identity, rollback_directories,
+    ), root_identity)
+
+
+def _write_relative_json(
+    adapter: RepositoryAdapter,
+    relative: str,
+    value: dict[str, Any],
+    expected_root_identity: dict[str, str] | None = None,
+) -> None:
+    if expected_root_identity is not None:
+        _assert_current_root_identity(adapter, expected_root_identity, "before metadata mutation")
+    adapter.atomic_write(
+        relative, (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
     )
 
 
-def _discard_transaction_backups(target: Path, actions: list[Action]) -> None:
+def _discard_transaction_backups(
+    adapter: RepositoryAdapter,
+    actions: list[Action],
+    expected_root_identity: dict[str, str] | None = None,
+) -> None:
+    if expected_root_identity is not None:
+        _assert_current_root_identity(adapter, expected_root_identity, "before backup cleanup")
     for action in actions:
         if action.backup is not None:
-            _safe_unlink(target, action.backup, missing_ok=True)
+            adapter.unlink(action.backup, missing_ok=True)
+
+
+def _remove_rollback_directories(
+    adapter: RepositoryAdapter,
+    rollback_directories: list[str],
+    expected_root_identity: dict[str, str],
+) -> None:
+    _assert_current_root_identity(
+        adapter, expected_root_identity, "before rollback directory cleanup"
+    )
+    for relative in reversed(rollback_directories):
+        try:
+            adapter.rmdir(relative)
+        except OSError as error:
+            if getattr(error, "winerror", None) == 145 or error.errno in {
+                errno.ENOTEMPTY,
+                errno.EEXIST,
+            }:
+                continue
+            raise
+
+
+def _complete_rollback_cleanup(
+    adapter: RepositoryAdapter,
+    journal_relative: str,
+    actions: list[Action],
+    rollback_directories: list[str],
+    expected_root_identity: dict[str, str],
+) -> None:
+    _discard_transaction_backups(adapter, actions, expected_root_identity)
+    _remove_rollback_directories(
+        adapter, rollback_directories, expected_root_identity
+    )
+    _assert_current_root_identity(
+        adapter, expected_root_identity, "before rollback journal cleanup"
+    )
+    adapter.unlink(journal_relative, missing_ok=True)
 
 
 def _rollback_actions(
@@ -866,93 +1526,162 @@ def _rollback_actions(
     operation: str,
     created_at: str,
     actions: list[Action],
+    rollback_directories: list[str] | None = None,
 ) -> None:
-    classifications = _classify_actions(target, actions)
-    _write_json(
-        journal_path,
-        _journal_value(target, transaction_id, operation, actions, "rollingBack", created_at),
-        target,
+    adapter = _repository_adapter(target)
+    _rollback_relative_actions(
+        adapter,
+        _relative(target, journal_path),
+        transaction_id,
+        operation,
+        created_at,
+        actions,
+        rollback_directories=rollback_directories,
     )
+
+
+def _rollback_relative_actions(
+    adapter: RepositoryAdapter,
+    journal_relative: str,
+    transaction_id: str,
+    operation: str,
+    created_at: str,
+    actions: list[Action],
+    root_identity: dict[str, str] | None = None,
+    rollback_directories: list[str] | None = None,
+) -> None:
+    transaction_identity = _validate_root_identity(root_identity or adapter.root_identity)
+    directories = (
+        list(rollback_directories)
+        if rollback_directories is not None
+        else _plan_rollback_directories(adapter, actions)
+    )
+    _assert_current_root_identity(adapter, transaction_identity, "before rollback")
+    classifications = _classify_actions(adapter, actions)
+    _write_relative_json(adapter, journal_relative, _journal_value(
+        adapter.root, transaction_id, operation, actions, "rollingBack", created_at,
+        transaction_identity, directories,
+    ), transaction_identity)
     for action in reversed(actions):
+        _assert_current_root_identity(adapter, transaction_identity, "before rolling back an action")
         if classifications[action.index] == "pre":
             action.phase = "rolledBack"
-            _write_json(
-                journal_path,
-                _journal_value(target, transaction_id, operation, actions, "rollingBack", created_at),
-                target,
-            )
+            _write_relative_json(adapter, journal_relative, _journal_value(
+                adapter.root, transaction_id, operation, actions, "rollingBack", created_at,
+                transaction_identity, directories,
+            ), transaction_identity)
             continue
         action.phase = "rollingBack"
-        _write_json(
-            journal_path,
-            _journal_value(target, transaction_id, operation, actions, "rollingBack", created_at),
-            target,
-        )
+        _write_relative_json(adapter, journal_relative, _journal_value(
+            adapter.root, transaction_id, operation, actions, "rollingBack", created_at,
+            transaction_identity, directories,
+        ), transaction_identity)
         if action.created:
-            if _current_hash(action.path, target) != action.post_hash:
-                raise WorkflowError(f"Created file no longer matches transaction content: {action.path}")
-            _safe_unlink(target, action.path)
+            if adapter.hash_file(action.path) != action.post_hash:
+                raise WorkflowError(
+                    f"Created file no longer matches transaction content: {adapter.display(action.path)}"
+                )
+            adapter.unlink(action.path)
         else:
-            if action.backup is None or _current_hash(action.backup, target) != action.backup_hash:
-                raise WorkflowError(f"Verified backup is unavailable for: {action.path}")
-            if _current_hash(action.path, target) != action.post_hash:
-                raise WorkflowError(f"Managed file no longer matches transaction content: {action.path}")
-            _atomic_write_managed(target, action.path, _safe_read_bytes(target, action.backup))
-        if _current_hash(action.path, target) != action.pre_hash:
-            raise WorkflowError(f"Rollback verification failed for: {action.path}")
+            if action.backup is None or adapter.hash_file(action.backup) != action.backup_hash:
+                raise WorkflowError(
+                    f"Verified backup is unavailable for: {adapter.display(action.path)}"
+                )
+            if adapter.hash_file(action.path) != action.post_hash:
+                raise WorkflowError(
+                    f"Managed file no longer matches transaction content: {adapter.display(action.path)}"
+                )
+            adapter.atomic_write(action.path, adapter.read_bytes(action.backup))
+        if adapter.hash_file(action.path) != action.pre_hash:
+            raise WorkflowError(f"Rollback verification failed for: {adapter.display(action.path)}")
         action.phase = "rolledBack"
-        _write_json(
-            journal_path,
-            _journal_value(target, transaction_id, operation, actions, "rollingBack", created_at),
-            target,
-        )
+        _write_relative_json(adapter, journal_relative, _journal_value(
+            adapter.root, transaction_id, operation, actions, "rollingBack", created_at,
+            transaction_identity, directories,
+        ), transaction_identity)
 
 
-def recover(target: Path, journal_path: Path, dry_run: bool) -> None:
-    if not _safe_exists(target, journal_path, require_file=True):
+def _recover_with_adapter(
+    adapter: RepositoryAdapter, target: Path, journal_path: Path, dry_run: bool
+) -> None:
+    root_identity = _validate_root_identity(adapter.root_identity)
+    journal_relative = adapter.normalize(_relative(target, journal_path))
+    if not adapter.exists(journal_relative, require_file=True):
         print("No interrupted transaction found.")
         return
-    transaction_id, operation, created_at, journal_phase, actions = _read_journal(
-        target, journal_path
-    )
+    (
+        transaction_id,
+        operation,
+        created_at,
+        journal_phase,
+        actions,
+        rollback_directories,
+    ) = _read_relative_journal(adapter, journal_relative, root_identity)
     if journal_phase == "committed":
         if dry_run:
             print("DRY-RUN: would finalize committed transaction cleanup")
             return
         if operation == "uninstall":
-            state_backup = _state_action_backup(target, actions)
-            previous_state = _read_state(state_backup, target)
+            _assert_current_root_identity(adapter, root_identity, "before committed cleanup")
+            state_backup = _state_action_backup(target, actions, adapter)
+            previous_state = _read_state(
+                adapter.display(state_backup), target, adapter, root_identity, allow_legacy=True
+            )
             if previous_state is None:
                 raise WorkflowError("Committed uninstall state backup is unavailable")
             _finalize_committed_uninstall(
-                target, journal_path, actions, previous_state
+                target, journal_path, actions, previous_state, adapter, root_identity
             )
         else:
             _cleanup_backup_files(
-                target, _install_commit_cleanup_paths(target, actions)
+                target, _install_commit_cleanup_paths(target, actions), adapter, root_identity
             )
-            _safe_unlink(target, journal_path, missing_ok=True)
+            _assert_current_root_identity(adapter, root_identity, "before journal cleanup")
+            adapter.unlink(journal_relative, missing_ok=True)
         print("RECOVERED: committed transaction cleanup finalized")
         return
-    classifications = _classify_actions(target, actions)
+    classifications = _classify_actions(adapter, actions)
     if dry_run:
         print(
             "DRY-RUN: would roll back "
             f"{sum(state == 'post' for state in classifications.values())} applied action(s)"
         )
         return
-    _rollback_actions(target, journal_path, transaction_id, operation, created_at, actions)
-    _safe_unlink(target, journal_path, missing_ok=True)
-    _discard_transaction_backups(target, actions)
+    _rollback_relative_actions(
+        adapter, journal_relative, transaction_id, operation, created_at, actions,
+        root_identity, rollback_directories,
+    )
+    _complete_rollback_cleanup(
+        adapter,
+        journal_relative,
+        actions,
+        rollback_directories,
+        root_identity,
+    )
     print("RECOVERED: interrupted transaction rolled back")
 
 
-def install(
+def recover(
+    target: Path,
+    journal_path: Path,
+    dry_run: bool,
+    adapter: RepositoryAdapter | None = None,
+) -> None:
+    repository = adapter or _repository_adapter(target)
+    try:
+        _recover_with_adapter(repository, target, journal_path, dry_run)
+    finally:
+        if adapter is None:
+            repository.close()
+
+
+def _install_with_adapter(
+    adapter: RepositoryAdapter,
     target: Path,
     source_root: Path,
     dry_run: bool,
     with_custom_agents: bool = False,
-) -> None:
+) -> str | None:
     _validate_sources(source_root, with_custom_agents)
     codex_version = _validate_codex_version()
     validation_warnings = (
@@ -960,21 +1689,25 @@ def install(
         if with_custom_agents
         else []
     )
-    state_path = target / STATE_FILENAME
-    journal_path = target / JOURNAL_FILENAME
-    if _safe_exists(target, journal_path, require_file=True):
-        raise WorkflowError(f"Interrupted transaction found. Run the installer with --recover: {journal_path}")
-    old_state = _read_state(state_path)
+    root_identity = _validate_root_identity(adapter.root_identity)
+    if adapter.exists(JOURNAL_FILENAME, require_file=True):
+        raise WorkflowError(
+            "Interrupted transaction found. Run the installer with --recover: "
+            f"{adapter.display(JOURNAL_FILENAME)}"
+        )
+    old_state = _read_state(
+        adapter.display(STATE_FILENAME), target, adapter, root_identity, allow_legacy=True
+    )
     if old_state and old_state.get("target") != str(target):
         raise WorkflowError("State manifest target does not match the requested repository")
-    if not old_state and _safe_exists(target, target / INSTALL_DIRECTORY):
+    if not old_state and adapter.exists(INSTALL_DIRECTORY):
         raise WorkflowError(
             f"{INSTALL_DIRECTORY} exists without a state manifest; move it aside or recover it manually"
         )
 
     transaction_id = uuid.uuid4().hex
     new_files: dict[str, Any] = dict(old_state.get("files", {})) if old_state else {}
-    requests: list[tuple[str, Path, bytes | None]] = []
+    requests: list[tuple[str, str, bytes | None]] = []
     messages: list[str] = []
     all_files = list(PACKAGE_FILES.items()) + list(PROJECT_TEMPLATE_FILES.items())
     if with_custom_agents:
@@ -991,15 +1724,12 @@ def install(
         directory_candidates.extend([".codex", ".codex/agents"])
     created_directories = list(old_state.get("createdDirectories", [])) if old_state else []
     for relative in directory_candidates:
-        if relative not in created_directories and not _safe_exists(
-            target, _target_path(target, relative)
-        ):
+        if relative not in created_directories and not adapter.exists(relative):
             created_directories.append(relative)
 
     for source_relative, installed_relative in all_files:
         source_path = source_root / source_relative
-        installed_path = _target_path(target, installed_relative)
-        _assert_no_symlink(target, installed_path)
+        installed_path = adapter.display(installed_relative)
         source_content = source_path.read_bytes()
         source_hash = _sha256_bytes(source_content)
         old_record = new_files.get(installed_relative)
@@ -1008,8 +1738,8 @@ def install(
         record_backup = old_record.get("backup") if old_record else None
         pre_install_hash = old_record.get("preInstallHash") if old_record else None
 
-        if _safe_exists(target, installed_path, require_file=True):
-            current_hash = _current_hash(installed_path, target)
+        if adapter.exists(installed_relative, require_file=True):
+            current_hash = adapter.hash_file(installed_relative)
             if old_record is None:
                 if installed_relative.startswith(f"{INSTALL_DIRECTORY}/"):
                     raise WorkflowError(f"Unmanaged package path already exists: {installed_path}")
@@ -1040,7 +1770,7 @@ def install(
                 messages.append(f"PRESERVED MODIFIED FILE: {installed_relative}")
                 continue
             if current_hash != source_hash:
-                requests.append(("write", installed_path, source_content))
+                requests.append(("write", installed_relative, source_content))
                 record_backup = (
                     Path(BACKUP_DIRECTORY)
                     / transaction_id
@@ -1054,7 +1784,7 @@ def install(
                 new_files.pop(installed_relative, None)
                 messages.append(f"PRESERVED ABSENT PRE-EXISTING CUSTOM AGENT: {installed_relative}")
                 continue
-            requests.append(("write", installed_path, source_content))
+            requests.append(("write", installed_relative, source_content))
             messages.append(f"INSTALL: {installed_relative}")
 
         new_files[installed_relative] = {
@@ -1074,11 +1804,10 @@ def install(
             "backup": record_backup,
         }
 
-    agents_path = target / "AGENTS.md"
-    _assert_no_symlink(target, agents_path)
+    agents_path = adapter.display("AGENTS.md")
     existing_agents = (
-        _safe_read_bytes(target, agents_path)
-        if _safe_exists(target, agents_path, require_file=True)
+        adapter.read_bytes("AGENTS.md")
+        if adapter.exists("AGENTS.md", require_file=True)
         else None
     )
     old_agents = old_state.get("agents") if old_state else None
@@ -1086,7 +1815,7 @@ def install(
     if agents_message:
         messages.append(agents_message)
     if agents_content is not None and agents_content != existing_agents:
-        requests.append(("write", agents_path, agents_content))
+        requests.append(("write", "AGENTS.md", agents_content))
         if existing_agents is not None and agents_record is not None:
             agents_record["backup"] = (
                 Path(BACKUP_DIRECTORY) / transaction_id / "AGENTS.md"
@@ -1104,12 +1833,12 @@ def install(
         referenced_backups.add(agents_record["backup"])
     old_backups = set(old_state.get("backups", [])) if old_state else set()
     for obsolete_backup in sorted(old_backups - referenced_backups):
-        obsolete_path = _target_path(target, obsolete_backup)
-        if _safe_exists(target, obsolete_path, require_file=True):
-            requests.append(("delete", obsolete_path, None))
+        if adapter.exists(obsolete_backup, require_file=True):
+            requests.append(("delete", obsolete_backup, None))
             messages.append(f"CLEAN OBSOLETE BACKUP: {obsolete_backup}")
     semantic_state = {
         "schema": SCHEMA,
+        "rootIdentity": root_identity,
         "packageVersion": PACKAGE_VERSION,
         "target": str(target),
         "codexVersion": codex_version,
@@ -1129,6 +1858,7 @@ def install(
             key: old_state.get(key)
             for key in (
                 "schema",
+                "rootIdentity",
                 "packageVersion",
                 "target",
                 "codexVersion",
@@ -1147,21 +1877,44 @@ def install(
             "transactionId": transaction_id,
         }
         state_content = (json.dumps(new_state, indent=2, sort_keys=True) + "\n").encode("utf-8")
-        requests.append(("write", state_path, state_content))
+        requests.append(("write", STATE_FILENAME, state_content))
 
     for warning in validation_warnings:
         print(f"WARN: {warning}")
     for message in messages:
         print(f"DRY-RUN: {message}" if dry_run else message)
     if dry_run:
-        print(f"DRY-RUN PASS: {len(requests)} write action(s); no files changed")
-        return
+        return f"DRY-RUN PASS: {len(requests)} write action(s); no files changed"
 
-    actions = _prepare_actions(target, transaction_id, requests)
-    _apply_actions(target, journal_path, transaction_id, "install", actions)
-    _cleanup_backup_files(target, _install_commit_cleanup_paths(target, actions))
-    _safe_unlink(target, journal_path, missing_ok=True)
-    print(f"PASS: Codex Multi-Agent Workflow installed in {target}")
+    actions = _prepare_relative_actions(adapter, transaction_id, requests)
+    _assert_current_root_identity(adapter, root_identity, "before transaction mutation")
+    _apply_relative_actions(adapter, JOURNAL_FILENAME, transaction_id, "install", actions)
+    _cleanup_backup_files(
+        target, _install_commit_cleanup_paths(target, actions), adapter, root_identity
+    )
+    _assert_current_root_identity(adapter, root_identity, "before journal cleanup")
+    adapter.unlink(JOURNAL_FILENAME, missing_ok=True)
+    return f"PASS: Codex Multi-Agent Workflow installed in {target}"
+
+
+def install(
+    target: Path,
+    source_root: Path,
+    dry_run: bool,
+    with_custom_agents: bool = False,
+    adapter: RepositoryAdapter | None = None,
+) -> str | None:
+    repository = adapter or _repository_adapter(target)
+    try:
+        success_message = _install_with_adapter(
+            repository, target, source_root, dry_run, with_custom_agents
+        )
+    finally:
+        if adapter is None:
+            repository.close()
+    if adapter is None and success_message is not None:
+        print(success_message)
+    return success_message
 
 
 def _remove_agents_content(existing: bytes, agents_record: dict[str, Any]) -> tuple[bytes | None, str | None]:
@@ -1184,63 +1937,90 @@ def _remove_agents_content(existing: bytes, agents_record: dict[str, Any]) -> tu
     return updated.encode("utf-8"), None
 
 
-def _remove_empty_managed_directories(target: Path, created_directories: list[str]) -> None:
+def _remove_empty_managed_directories(
+    target: Path,
+    created_directories: list[str],
+    adapter: RepositoryAdapter | None = None,
+    expected_root_identity: dict[str, str] | None = None,
+) -> None:
+    repository = adapter or _repository_adapter(target)
+    if expected_root_identity is not None:
+        _assert_current_root_identity(
+            repository, expected_root_identity, "before directory cleanup"
+        )
     candidates = {
-        target / INSTALL_DIRECTORY / "rules",
-        target / INSTALL_DIRECTORY / "templates",
-        target / INSTALL_DIRECTORY,
-        target / "docs" / "ai",
-        target / "plans",
+        f"{INSTALL_DIRECTORY}/rules",
+        f"{INSTALL_DIRECTORY}/templates",
+        INSTALL_DIRECTORY,
+        "docs/ai",
+        "plans",
     }
-    candidates.update(_target_path(target, relative) for relative in created_directories)
-    for candidate in sorted(candidates, key=lambda value: len(value.parts), reverse=True):
+    candidates.update(repository.normalize(relative) for relative in created_directories)
+    for candidate in sorted(candidates, key=lambda value: len(Path(value).parts), reverse=True):
         try:
-            _safe_rmdir(target, candidate)
+            repository.rmdir(candidate)
         except OSError:
             pass
 
 
-def _cleanup_backup_files(target: Path, backup_paths: list[Path]) -> None:
-    backup_root = target / BACKUP_DIRECTORY
-    parents: set[Path] = set()
+def _cleanup_backup_files(
+    target: Path,
+    backup_paths: list[str | Path],
+    adapter: RepositoryAdapter | None = None,
+    expected_root_identity: dict[str, str] | None = None,
+) -> None:
+    repository = adapter or _repository_adapter(target)
+    if expected_root_identity is not None:
+        _assert_current_root_identity(
+            repository, expected_root_identity, "before backup cleanup"
+        )
+    parents: set[str] = set()
     for backup_path in backup_paths:
-        try:
-            backup_path.relative_to(backup_root)
-        except ValueError as error:
-            raise WorkflowError(f"Backup path escapes the managed backup directory: {backup_path}") from error
-        _safe_unlink(target, backup_path, missing_ok=True)
-        current = backup_path.parent
-        while current != target and current != backup_root.parent:
-            parents.add(current)
-            if current == backup_root:
+        relative = (
+            _relative(target, backup_path) if isinstance(backup_path, Path) else backup_path
+        )
+        relative = repository.normalize(relative)
+        parts = Path(relative).parts
+        if not parts or parts[0] != BACKUP_DIRECTORY:
+            raise WorkflowError(
+                f"Backup path escapes the managed backup directory: {repository.display(relative)}"
+            )
+        repository.unlink(relative, missing_ok=True)
+        current = Path(relative).parent
+        while current != Path("."):
+            current_relative = current.as_posix()
+            parents.add(current_relative)
+            if current_relative == BACKUP_DIRECTORY:
                 break
             current = current.parent
-    for parent in sorted(parents, key=lambda value: len(value.parts), reverse=True):
+    for parent in sorted(parents, key=lambda value: len(Path(value).parts), reverse=True):
         try:
-            _safe_rmdir(target, parent)
+            repository.rmdir(parent)
         except OSError:
             pass
 
 
-def _state_action_backup(target: Path, actions: list[Action]) -> Path:
-    state_actions = [action for action in actions if action.path == target / STATE_FILENAME]
+def _state_action_backup(
+    target: Path, actions: list[Action], adapter: RepositoryAdapter | None = None
+) -> str:
+    repository = adapter or _repository_adapter(target)
+    state_actions = [action for action in actions if action.path == STATE_FILENAME]
     if len(state_actions) != 1 or state_actions[0].backup is None:
         raise WorkflowError("Committed transaction lacks its verified state backup")
     state_action = state_actions[0]
-    if _current_hash(state_action.backup, target) != state_action.backup_hash:
+    if repository.hash_file(state_action.backup) != state_action.backup_hash:
         raise WorkflowError("Committed transaction state backup is missing or tampered")
     return state_action.backup
 
 
-def _install_commit_cleanup_paths(target: Path, actions: list[Action]) -> list[Path]:
-    backup_root = target / BACKUP_DIRECTORY
+def _install_commit_cleanup_paths(target: Path, actions: list[Action]) -> list[str]:
     return [
         action.backup
         for action in actions
         if action.backup is not None
         and (
-            action.path == target / STATE_FILENAME
-            or action.path.is_relative_to(backup_root)
+            action.path == STATE_FILENAME
+            or Path(action.path).parts[0] == BACKUP_DIRECTORY
         )
     ]
 
@@ -1250,84 +2030,101 @@ def _finalize_committed_uninstall(
     journal_path: Path,
     actions: list[Action],
     previous_state: dict[str, Any],
+    adapter: RepositoryAdapter | None = None,
+    expected_root_identity: dict[str, str] | None = None,
 ) -> None:
-    state_backup = _state_action_backup(target, actions)
-    committed_state = _read_state(target / STATE_FILENAME)
+    repository = adapter or _repository_adapter(target)
+    root_identity = _validate_root_identity(
+        expected_root_identity or repository.root_identity
+    )
+    _assert_current_root_identity(repository, root_identity, "before uninstall cleanup")
+    state_backup = _state_action_backup(target, actions, repository)
+    committed_state = _read_state(
+        repository.display(STATE_FILENAME), target, repository, root_identity,
+        allow_legacy=False,
+    )
     retained_backups = set(committed_state["backups"]) if committed_state is not None else set()
     prerequisites = [
         action.backup
         for action in actions
         if action.backup is not None and action.backup != state_backup
     ] + [
-        _target_path(target, backup)
+        backup
         for backup in previous_state["backups"]
         if backup not in retained_backups
     ]
-    _cleanup_backup_files(target, prerequisites)
+    _cleanup_backup_files(target, prerequisites, repository, root_identity)
     _remove_empty_managed_directories(
         target,
         list(previous_state["createdDirectories"]),
+        repository,
+        root_identity,
     )
-    _safe_unlink(target, journal_path, missing_ok=True)
+    _assert_current_root_identity(repository, root_identity, "before journal cleanup")
+    repository.unlink(_relative(target, journal_path), missing_ok=True)
     try:
-        _cleanup_backup_files(target, [state_backup])
+        _cleanup_backup_files(target, [state_backup], repository, root_identity)
     except (OSError, WorkflowError):
         pass
 
 
-def uninstall(target: Path, dry_run: bool) -> None:
-    state_path = target / STATE_FILENAME
-    journal_path = target / JOURNAL_FILENAME
-    if _safe_exists(target, journal_path, require_file=True):
-        raise WorkflowError(f"Interrupted transaction found. Run the uninstaller with --recover: {journal_path}")
-    state = _read_state(state_path)
+def _uninstall_with_adapter(
+    adapter: RepositoryAdapter, target: Path, dry_run: bool
+) -> str | None:
+    root_identity = _validate_root_identity(adapter.root_identity)
+    if adapter.exists(JOURNAL_FILENAME, require_file=True):
+        raise WorkflowError(
+            "Interrupted transaction found. Run the uninstaller with --recover: "
+            f"{adapter.display(JOURNAL_FILENAME)}"
+        )
+    state = _read_state(
+        adapter.display(STATE_FILENAME), target, adapter, root_identity, allow_legacy=True
+    )
     if state is None:
         print("WARN: no state manifest found; no files were removed")
         print(f"Manual review may be required for {target / INSTALL_DIRECTORY} and the AGENTS.md managed block")
-        return
+        return None
     if state.get("target") != str(target):
         raise WorkflowError("State manifest target does not match the requested repository")
 
-    requests: list[tuple[str, Path, bytes | None]] = []
+    requests: list[tuple[str, str, bytes | None]] = []
     remaining_files: dict[str, Any] = {}
     for installed_relative, record in state["files"].items():
-        installed_path = _target_path(target, installed_relative)
-        _assert_no_symlink(target, installed_path)
-        if not _safe_exists(target, installed_path, require_file=True):
+        installed_path = adapter.display(installed_relative)
+        if not adapter.exists(installed_relative, require_file=True):
             print(f"ALREADY ABSENT: {installed_relative}")
             continue
         if record.get("owner") == "preexisting-identical":
             print(f"PRESERVED PRE-EXISTING FILE: {installed_relative}")
             continue
-        if _current_hash(installed_path, target) != record.get("installedHash"):
+        if adapter.hash_file(installed_relative) != record.get("installedHash"):
             print(f"PRESERVED MODIFIED FILE: {installed_relative}")
             remaining_files[installed_relative] = record
             continue
-        requests.append(("delete", installed_path, None))
+        requests.append(("delete", installed_relative, None))
         print(f"DRY-RUN: REMOVE: {installed_relative}" if dry_run else f"REMOVE: {installed_relative}")
 
     agents_record = state.get("agents")
     remaining_agents = agents_record
     if agents_record:
-        agents_path = _target_path(target, agents_record.get("path", "AGENTS.md"))
-        _assert_no_symlink(target, agents_path)
-        if not _safe_exists(target, agents_path, require_file=True):
+        agents_relative = adapter.normalize(agents_record.get("path", "AGENTS.md"))
+        if not adapter.exists(agents_relative, require_file=True):
             print("ALREADY ABSENT: AGENTS.md")
             remaining_agents = None
         else:
             updated_agents, warning = _remove_agents_content(
-                _safe_read_bytes(target, agents_path), agents_record
+                adapter.read_bytes(agents_relative), agents_record
             )
             if warning:
                 print(warning)
                 if "already absent" in warning:
                     remaining_agents = None
             elif updated_agents == b"":
-                requests.append(("delete", agents_path, None))
+                requests.append(("delete", agents_relative, None))
                 remaining_agents = None
                 print("DRY-RUN: REMOVE: generated AGENTS.md" if dry_run else "REMOVE: generated AGENTS.md")
             elif updated_agents is not None:
-                requests.append(("write", agents_path, updated_agents))
+                requests.append(("write", agents_relative, updated_agents))
                 remaining_agents = None
                 print("DRY-RUN: REMOVE: AGENTS.md managed block" if dry_run else "REMOVE: AGENTS.md managed block")
 
@@ -1341,31 +2138,50 @@ def uninstall(target: Path, dry_run: bool) -> None:
         if remaining_agents is not None and remaining_agents.get("backup") is not None:
             remaining_backups.add(remaining_agents["backup"])
         for obsolete_backup in sorted(set(state["backups"]) - remaining_backups):
-            obsolete_path = _target_path(target, obsolete_backup)
-            if _safe_exists(target, obsolete_path, require_file=True):
-                requests.append(("delete", obsolete_path, None))
+            if adapter.exists(obsolete_backup, require_file=True):
+                requests.append(("delete", obsolete_backup, None))
         updated_state = dict(state)
+        updated_state["schema"] = SCHEMA
+        updated_state["rootIdentity"] = root_identity
         updated_state["files"] = remaining_files
         updated_state["agents"] = remaining_agents
         updated_state["backups"] = sorted(remaining_backups)
         updated_state["updatedAt"] = _now()
         updated_state["transactionId"] = transaction_id
         state_content = (json.dumps(updated_state, indent=2, sort_keys=True) + "\n").encode("utf-8")
-        requests.append(("write", state_path, state_content))
+        requests.append(("write", STATE_FILENAME, state_content))
     else:
-        requests.append(("delete", state_path, None))
+        requests.append(("delete", STATE_FILENAME, None))
 
     if dry_run:
-        print(f"DRY-RUN PASS: {len(requests)} action(s); no files changed")
-        return
+        return f"DRY-RUN PASS: {len(requests)} action(s); no files changed"
 
-    actions = _prepare_actions(target, transaction_id, requests)
-    _apply_actions(target, journal_path, transaction_id, "uninstall", actions)
-    _finalize_committed_uninstall(target, journal_path, actions, state)
+    actions = _prepare_relative_actions(adapter, transaction_id, requests)
+    _assert_current_root_identity(adapter, root_identity, "before transaction mutation")
+    _apply_relative_actions(adapter, JOURNAL_FILENAME, transaction_id, "uninstall", actions)
+    _finalize_committed_uninstall(
+        target, adapter.display(JOURNAL_FILENAME), actions, state, adapter, root_identity
+    )
     if remaining_files or remaining_agents:
         print("WARN: uninstall preserved modified managed content; state manifest retained")
-    else:
-        print(f"PASS: Codex Multi-Agent Workflow uninstalled from {target}")
+        return None
+    return f"PASS: Codex Multi-Agent Workflow uninstalled from {target}"
+
+
+def uninstall(
+    target: Path,
+    dry_run: bool,
+    adapter: RepositoryAdapter | None = None,
+) -> str | None:
+    repository = adapter or _repository_adapter(target)
+    try:
+        success_message = _uninstall_with_adapter(repository, target, dry_run)
+    finally:
+        if adapter is None:
+            repository.close()
+    if adapter is None and success_message is not None:
+        print(success_message)
+    return success_message
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1384,23 +2200,42 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _parser().parse_args()
+    adapter: RepositoryAdapter | None = None
+    success_message: str | None = None
+    result = 0
     try:
-        target = _assert_safe_target(args.target)
+        adapter = _repository_adapter_from_raw_target(args.target)
+        target = adapter.root
         journal_path = target / JOURNAL_FILENAME
         if args.recover:
-            recover(target, journal_path, args.dry_run)
+            recover(target, journal_path, args.dry_run, adapter)
         elif args.operation == "install":
             source_root = Path(__file__).resolve().parent.parent
-            install(target, source_root, args.dry_run, args.with_custom_agents)
+            success_message = install(
+                target,
+                source_root,
+                args.dry_run,
+                args.with_custom_agents,
+                adapter,
+            )
         else:
-            uninstall(target, args.dry_run)
-        return 0
+            success_message = uninstall(target, args.dry_run, adapter)
     except WorkflowError as error:
         print(f"FAIL: {error}", file=sys.stderr)
-        return 1
+        result = 1
     except (OSError, UnicodeError) as error:
         print(f"FAIL: filesystem operation failed: {error}", file=sys.stderr)
-        return 1
+        result = 1
+    finally:
+        if adapter is not None:
+            try:
+                adapter.close()
+            except (OSError, WorkflowError) as error:
+                print(f"FAIL: {error}", file=sys.stderr)
+                result = 1
+    if result == 0 and success_message is not None:
+        print(success_message)
+    return result
 
 
 if __name__ == "__main__":

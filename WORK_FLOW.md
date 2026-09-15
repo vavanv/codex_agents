@@ -639,10 +639,32 @@ Codex discovers project instructions from the project root toward the current di
 
 1. Install in a disposable or non-critical project first.
 2. Complete `PROJECT_CONTEXT.md` accurately.
-3. Verify instruction discovery.
+3. [Verify instruction discovery](#verify-instruction-discovery). From the target repository root, start a new Codex check using the read-only prompt in that section. Do not let the check edit files or run project commands. Confirm that it identifies the target `AGENTS.md`, workflow contracts and project context, root ownership of plan and handoff state, the direct-evidence requirement, and that commit does not imply push. This checks instruction discovery only; it does not establish custom-agent runtime PASS.
 4. Try a text-only trivial-task classification.
 5. Try a normal task that creates a plan and handoff.
-6. Confirm validation evidence is recorded.
+6. Confirm validation evidence is recorded for the non-trivial task. Installation does not create `plans/ACTIVE_PLAN.md` or `plans/HANDOFF.md`; inspect them when the workflow creates them, and inspect `plans/execution-log.jsonl` only if the task uses that optional ledger. The root owns these files. Each task and acceptance criterion must map to an exact validation command, its exit code, a concise relevant observation or artifact path, an honest `PASS`, `FAIL`, or `BLOCKED` result, and a timestamp when the workflow records one. Evidence must be redacted and contain no secrets. Normal and complex work also needs independent-validator evidence; work requiring high-risk review needs the reviewer's verdict. Missing required evidence means the task is not complete.
+
+   Read-only PowerShell inspection from the target root (run `Get-Content` only for paths reported as present):
+
+   ```powershell
+   if (Test-Path -LiteralPath '.\plans\ACTIVE_PLAN.md') {
+       Get-Content -LiteralPath '.\plans\ACTIVE_PLAN.md'
+   }
+   if (Test-Path -LiteralPath '.\plans\HANDOFF.md') {
+       Get-Content -LiteralPath '.\plans\HANDOFF.md'
+   }
+   if (Test-Path -LiteralPath '.\plans\execution-log.jsonl') {
+       Get-Content -LiteralPath '.\plans\execution-log.jsonl'
+   }
+   ```
+
+   POSIX equivalent:
+
+   ```bash
+   test -f plans/ACTIVE_PLAN.md && sed -n '1,240p' plans/ACTIVE_PLAN.md
+   test -f plans/HANDOFF.md && sed -n '1,240p' plans/HANDOFF.md
+   test -f plans/execution-log.jsonl && sed -n '1,240p' plans/execution-log.jsonl
+   ```
 7. Test commit-only authorization without pushing.
 8. Preview uninstall and confirm modified project context is preserved.
 9. Adopt in additional repositories only after the pilot behaves as expected.

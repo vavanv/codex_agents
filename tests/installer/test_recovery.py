@@ -38,6 +38,8 @@ class RecoveryTests(unittest.TestCase):
         applied_indexes: set[int] | None = None,
     ) -> tuple[Path, list[manager.Action]]:
         actions = manager._prepare_actions(target, self.transaction_id, requests)
+        adapter = manager.PathRepositoryAdapter(target)
+        rollback_directories = manager._plan_rollback_directories(adapter, actions)
         journal_path = target / manager.JOURNAL_FILENAME
         manager._write_json(
             journal_path,
@@ -48,16 +50,18 @@ class RecoveryTests(unittest.TestCase):
                 actions,
                 "prepared",
                 self.created_at,
+                rollback_directories=rollback_directories,
             ),
             target,
         )
         manager._prepare_backups(target, actions)
         for action in actions:
             if applied_indexes and action.index in applied_indexes:
+                action_path = target / action.path
                 if action.kind == "write":
-                    manager._atomic_write(action.path, action.content or b"")
+                    manager._atomic_write(action_path, action.content or b"")
                 else:
-                    action.path.unlink(missing_ok=True)
+                    action_path.unlink(missing_ok=True)
                 action.phase = "applied"
         manager._write_json(
             journal_path,
@@ -68,11 +72,12 @@ class RecoveryTests(unittest.TestCase):
                 actions,
                 "applying",
                 self.created_at,
+                rollback_directories=rollback_directories,
             ),
         )
         return journal_path, actions
 
-    def test_journal_v2_records_verified_hashes_before_target_mutation(self) -> None:
+    def test_journal_v4_records_verified_hashes_before_target_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory)
             existing = self.managed_path(target, 0)
@@ -85,7 +90,14 @@ class RecoveryTests(unittest.TestCase):
                 [("write", existing, b"after"), ("write", created, b"created")],
             )
             value = manager._journal_value(
-                target, self.transaction_id, "install", actions, created_at=self.created_at
+                target,
+                self.transaction_id,
+                "install",
+                actions,
+                created_at=self.created_at,
+                rollback_directories=manager._plan_rollback_directories(
+                    manager.PathRepositoryAdapter(target), actions
+                ),
             )
 
             self.assertEqual(manager.JOURNAL_SCHEMA, value["schema"])
@@ -96,6 +108,12 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(value["actions"][0]["preHash"], value["actions"][0]["backupHash"])
             self.assertEqual("workflow-manager", value["actions"][0]["owner"])
             self.assertIsNone(value["actions"][1]["preHash"])
+            self.assertEqual(
+                manager._canonical_directory_order(
+                    set(value["rollbackDirectories"])
+                ),
+                value["rollbackDirectories"],
+            )
 
     def test_recovery_restores_applied_actions_and_is_repeatable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -165,8 +183,9 @@ class RecoveryTests(unittest.TestCase):
                         [("write", first, b"new-one"), ("write", second, b"new-two")],
                         {0, 1},
                     )
-                    backup = actions[0].backup
-                    self.assertIsNotNone(backup)
+                    backup_relative = actions[0].backup
+                    self.assertIsNotNone(backup_relative)
+                    backup = target / backup_relative
                     if replacement is None:
                         backup.unlink()
                     else:
@@ -198,7 +217,7 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(b"after", path.read_bytes())
             self.assertTrue(journal_path.exists())
             self.assertIsNotNone(actions[0].backup)
-            self.assertTrue(actions[0].backup.exists())
+            self.assertTrue((target / actions[0].backup).exists())
 
     def test_forged_non_managed_action_path_is_rejected_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -233,7 +252,7 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(b"after", managed.read_bytes())
             self.assertEqual(b"after", arbitrary.read_bytes())
             self.assertTrue(journal_path.exists())
-            self.assertTrue(original_backup.exists())
+            self.assertTrue((target / original_backup).exists())
             self.assertTrue(forged_backup.exists())
 
     def test_malformed_legacy_and_invalid_hash_journals_are_retained(self) -> None:
@@ -321,7 +340,9 @@ class RecoveryTests(unittest.TestCase):
             path = self.managed_path(target, 0)
             path.write_bytes(b"before")
             journal_path, actions = self.prepare(target, [("write", path, b"after")], {0})
-            backup = actions[0].backup
+            backup_relative = actions[0].backup
+            self.assertIsNotNone(backup_relative)
+            backup = target / backup_relative
             original_atomic_write = manager._atomic_write
 
             def fail_restore(destination: Path, content: bytes) -> None:
@@ -335,7 +356,6 @@ class RecoveryTests(unittest.TestCase):
 
             self.assertEqual(b"after", path.read_bytes())
             self.assertTrue(journal_path.exists())
-            self.assertIsNotNone(backup)
             self.assertTrue(backup.exists())
 
     def test_state_manifest_action_must_be_last(self) -> None:
@@ -379,7 +399,7 @@ class RecoveryTests(unittest.TestCase):
             )
             manager._prepare_backups(target, actions)
             for action in actions:
-                action.path.unlink()
+                (target / action.path).unlink()
                 action.phase = "applied"
             manager._write_json(
                 journal_path,
@@ -493,8 +513,9 @@ class RecoveryTests(unittest.TestCase):
                 self.transaction_id,
                 [("write", managed, b"after")],
             )
-            backup = actions[0].backup
-            self.assertIsNotNone(backup)
+            backup_relative = actions[0].backup
+            self.assertIsNotNone(backup_relative)
+            backup = target / backup_relative
             journal_path = target / manager.JOURNAL_FILENAME
             original_atomic_write = manager._atomic_write
 

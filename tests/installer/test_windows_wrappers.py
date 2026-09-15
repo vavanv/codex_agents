@@ -42,6 +42,7 @@ class WindowsWrapperTests(unittest.TestCase):
                 encoding="utf-8",
             )
             environment = os.environ.copy()
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
             environment["PATH"] = str(fake_bin) + os.pathsep + environment.get("PATH", "")
             environment["FAKE_CAPTURE"] = str(capture_path)
             environment["FAKE_EXIT_CODE"] = str(fake_exit_code)
@@ -104,6 +105,7 @@ class WindowsWrapperTests(unittest.TestCase):
             target = root / "isolated repository with spaces"
             target.mkdir()
             environment = os.environ.copy()
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
             environment["PATH"] = str(fake_bin) + os.pathsep + environment.get("PATH", "")
 
             install = subprocess.run(
