@@ -1,0 +1,13 @@
+{
+  "cases": [
+    {
+      "critical": true,
+      "id": "synthetic-pass"
+    },
+    {
+      "critical": true,
+      "id": "synthetic-unattempted"
+    }
+  ],
+  "schema": "codex-live-case-manifest/v1"
+}

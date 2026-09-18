@@ -260,6 +260,32 @@ class NativeRepositoryFsTests(unittest.TestCase):
         self.fs.rmdir("one")
         self.assertFalse((self.repository / "one").exists())
 
+    def test_close_releases_cached_children_before_parents_and_acquisition_chain(self) -> None:
+        self.fs.ensure_directories("one/two")
+        capabilities = sorted(
+            self.fs._directories.values(),
+            key=lambda item: len(item.relative.split("/")) if item.relative else 0,
+        )
+        acquisition = list(self.fs._acquisition_handles)
+        expected = [item.handle.value for item in reversed(capabilities)] + [
+            item.value for item in reversed(acquisition)
+        ]
+        closed: list[int] = []
+        real_close = self.fs._api.close
+
+        def recording_close(value: int) -> bool:
+            closed.append(value)
+            return real_close(value)
+
+        for capability in capabilities:
+            capability.handle._closer = recording_close
+        for handle in acquisition:
+            handle._closer = recording_close
+
+        self.fs.close()
+
+        self.assertEqual(expected, closed)
+
     def test_missing_ok_remove_accepts_a_missing_ancestor(self) -> None:
         self.fs.unlink("missing/child.txt", missing_ok=True)
         self.fs.rmdir("missing/child", missing_ok=True)

@@ -20,11 +20,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn, Protocol
 
-SCHEMA = "hybrid-codex-installer/v2"
+SCHEMA = "hybrid-codex-installer/v3"
+PREVIOUS_STATE_SCHEMA = "hybrid-codex-installer/v2"
 LEGACY_STATE_SCHEMA = "hybrid-codex-installer/v1"
-JOURNAL_SCHEMA = "hybrid-codex-installer-transaction/v4"
-LEGACY_JOURNAL_SCHEMA = "hybrid-codex-installer-transaction/v3"
-OLDER_JOURNAL_SCHEMA = "hybrid-codex-installer-transaction/v2"
+JOURNAL_SCHEMA = "hybrid-codex-installer-transaction/v5"
+LEGACY_JOURNAL_SCHEMA = "hybrid-codex-installer-transaction/v4"
+OLDER_JOURNAL_SCHEMA = "hybrid-codex-installer-transaction/v3"
+OLDER_JOURNAL_SCHEMAS = {
+    OLDER_JOURNAL_SCHEMA,
+    "hybrid-codex-installer-transaction/v2",
+}
 ROOT_IDENTITY_SCHEMA = "hybrid-codex-repository-root/v1"
 PACKAGE_VERSION = "0.2.0-agents-preview"
 SUPPORTED_CODEX_VERSIONS = {"0.154.0"}
@@ -144,13 +149,19 @@ class RepositoryAdapter(Protocol):
 
     def hash_file(self, relative: str) -> str | None: ...
 
-    def mkdir(self, relative: str) -> None: ...
+    def directory_identity(self, relative: str) -> dict[str, str] | None: ...
+
+    def mkdir(
+        self, relative: str, expected_absent: bool = False
+    ) -> tuple[dict[str, str], bool]: ...
 
     def atomic_write(self, relative: str, content: bytes) -> None: ...
 
     def unlink(self, relative: str, missing_ok: bool = False) -> None: ...
 
-    def rmdir(self, relative: str) -> None: ...
+    def rmdir(
+        self, relative: str, expected_identity: dict[str, str] | None = None
+    ) -> None: ...
 
     def observe_root_identity(self) -> dict[str, str]: ...
 
@@ -227,10 +238,43 @@ class PathRepositoryAdapter:
     def hash_file(self, relative: str) -> str | None:
         return _current_hash(self.display(relative), self.root)
 
-    def mkdir(self, relative: str) -> None:
+    def directory_identity(self, relative: str) -> dict[str, str] | None:
         path = self.display(relative)
-        path.mkdir(parents=True, exist_ok=True)
+        value = _lstat_optional(path)
+        if value is None:
+            return None
+        if not stat.S_ISDIR(value.st_mode):
+            raise WorkflowError(f"Managed directory is not a directory: {path}")
         _assert_safe_path(self.root, path)
+        return {
+            "schema": ROOT_IDENTITY_SCHEMA,
+            "platform": sys.platform,
+            "mode": "path-stat",
+            "deviceId": str(value.st_dev),
+            "fileId": str(value.st_ino),
+        }
+
+    def mkdir(
+        self, relative: str, expected_absent: bool = False
+    ) -> tuple[dict[str, str], bool]:
+        path = self.display(relative)
+        before = self.directory_identity(relative)
+        if expected_absent and before is not None:
+            raise WorkflowError(
+                f"Managed directory expected to be absent was opened: {path}"
+            )
+        created = before is None
+        try:
+            path.mkdir(parents=False, exist_ok=not expected_absent)
+        except FileExistsError as error:
+            raise WorkflowError(
+                f"Managed directory expected to be absent was opened: {path}"
+            ) from error
+        _assert_safe_path(self.root, path)
+        identity = self.directory_identity(relative)
+        if identity is None:
+            raise WorkflowError(f"Managed directory creation failed: {path}")
+        return identity, created
 
     def atomic_write(self, relative: str, content: bytes) -> None:
         _atomic_write_managed(self.root, self.display(relative), content)
@@ -238,7 +282,16 @@ class PathRepositoryAdapter:
     def unlink(self, relative: str, missing_ok: bool = False) -> None:
         _safe_unlink(self.root, self.display(relative), missing_ok=missing_ok)
 
-    def rmdir(self, relative: str) -> None:
+    def rmdir(
+        self, relative: str, expected_identity: dict[str, str] | None = None
+    ) -> None:
+        if expected_identity is not None:
+            current = self.directory_identity(relative)
+            if current is None:
+                return
+            _assert_directory_identity_matches(
+                expected_identity, current, f"before removing {relative}"
+            )
         _safe_rmdir(self.root, self.display(relative))
 
     def close(self) -> None:
@@ -372,13 +425,47 @@ class WindowsRepositoryAdapter:
             "hashing file", relative, lambda: self._filesystem.hash_file(relative)
         )
 
-    def mkdir(self, relative: str) -> None:
+    def directory_identity(self, relative: str) -> dict[str, str] | None:
         relative = self.normalize(relative)
-        self._call(
+        try:
+            identity = self._filesystem.directory_identity(relative)
+        except OSError as error:
+            if getattr(error, "winerror", None) in {2, 3}:
+                return None
+            _raise_native_workflow_error(
+                self._module, error, "observing directory identity", relative
+            )
+        except Exception as error:
+            _raise_native_workflow_error(
+                self._module, error, "observing directory identity", relative
+            )
+        return {
+            "schema": ROOT_IDENTITY_SCHEMA,
+            "platform": "win32",
+            "mode": "windows-ntfs-handle",
+            "volumeSerialNumber": f"{identity.volume_serial_number:016x}",
+            "fileId": identity.file_id,
+        }
+
+    def mkdir(
+        self, relative: str, expected_absent: bool = False
+    ) -> tuple[dict[str, str], bool]:
+        relative = self.normalize(relative)
+        observation = self._call(
             "creating directories",
             relative,
-            lambda: self._filesystem.ensure_directories(relative),
-        )
+            lambda: self._filesystem.ensure_directories(
+                relative, expected_absent=expected_absent
+            ),
+        )[-1]
+        identity = {
+            "schema": ROOT_IDENTITY_SCHEMA,
+            "platform": "win32",
+            "mode": "windows-ntfs-handle",
+            "volumeSerialNumber": f"{observation.identity.volume_serial_number:016x}",
+            "fileId": observation.identity.file_id,
+        }
+        return identity, bool(observation.created)
 
     def atomic_write(self, relative: str, content: bytes) -> None:
         relative = self.normalize(relative)
@@ -399,12 +486,36 @@ class WindowsRepositoryAdapter:
             lambda: self._filesystem.unlink(relative, missing_ok=missing_ok),
         )
 
-    def rmdir(self, relative: str) -> None:
+    def rmdir(
+        self, relative: str, expected_identity: dict[str, str] | None = None
+    ) -> None:
         relative = self.normalize(relative)
+        native_identity = None
+        if expected_identity is not None:
+            validated = _validate_root_identity(expected_identity)
+            if validated["mode"] != "windows-ntfs-handle":
+                current = self.directory_identity(relative)
+                if current is None:
+                    return
+                _assert_directory_identity_matches(
+                    validated, current, f"before removing {relative}"
+                )
+                validated = current
+            native_identity = self._module.RootIdentity(
+                int(validated["volumeSerialNumber"], 16), validated["fileId"]
+            )
         try:
-            self._filesystem.rmdir(relative, missing_ok=True)
+            self._filesystem.rmdir(
+                relative,
+                missing_ok=True,
+                expected_identity=native_identity,
+            )
         except OSError as error:
-            if getattr(error, "winerror", None) == 145:
+            if getattr(error, "winerror", None) == 145 or error.errno in {
+                145,
+                errno.ENOTEMPTY,
+                errno.EEXIST,
+            }:
                 return
             _raise_native_workflow_error(
                 self._module, error, "removing directory", relative
@@ -572,6 +683,15 @@ def _assert_persisted_root_identity_matches(
     raise WorkflowError(f"Repository root identity does not match {context}")
 
 
+def _assert_directory_identity_matches(
+    expected: dict[str, str], actual: dict[str, str], context: str
+) -> None:
+    try:
+        _assert_persisted_root_identity_matches(expected, actual, context)
+    except WorkflowError as error:
+        raise WorkflowError(f"Managed directory identity does not match {context}") from error
+
+
 def _assert_current_root_identity(
     adapter: RepositoryAdapter, expected: dict[str, str], context: str
 ) -> None:
@@ -732,6 +852,7 @@ def _read_state(
     adapter: RepositoryAdapter | None = None,
     expected_root_identity: dict[str, str] | None = None,
     allow_legacy: bool = False,
+    validate_directories: bool = True,
 ) -> dict[str, Any] | None:
     target = expected_target or path.parent
     repository = adapter or _repository_adapter(target)
@@ -752,6 +873,14 @@ def _read_state(
         raise WorkflowError(f"Unsupported or malformed state manifest: {path}")
     schema = value.get("schema")
     if schema == SCHEMA:
+        if set(value) != legacy_root_keys | {"rootIdentity", "directoryIdentities"}:
+            raise WorkflowError(f"Unsupported or malformed state manifest: {path}")
+        state_identity = _validate_root_identity(value.get("rootIdentity"))
+        current_identity = expected_root_identity or repository.root_identity
+        _assert_persisted_root_identity_matches(
+            state_identity, current_identity, "since the state manifest was written"
+        )
+    elif schema == PREVIOUS_STATE_SCHEMA and allow_legacy:
         if set(value) != legacy_root_keys | {"rootIdentity"}:
             raise WorkflowError(f"Unsupported or malformed state manifest: {path}")
         state_identity = _validate_root_identity(value.get("rootIdentity"))
@@ -905,10 +1034,32 @@ def _read_state(
         or features["customAgents"] != expected_custom_agents
     ):
         raise WorkflowError(f"Malformed features in state manifest: {path}")
-    if schema == LEGACY_STATE_SCHEMA:
+    if schema == SCHEMA:
+        identities = value.get("directoryIdentities")
+        expected_directories = _state_directory_paths(value)
+        if (
+            not isinstance(identities, dict)
+            or set(identities) != set(expected_directories)
+        ):
+            raise WorkflowError(f"Malformed directory identities in state manifest: {path}")
+        for relative in expected_directories:
+            expected_identity = _validate_root_identity(identities[relative])
+            if not validate_directories:
+                continue
+            current_identity = repository.directory_identity(relative)
+            if current_identity is None:
+                raise WorkflowError(
+                    f"Managed directory recorded by state is missing: {relative}"
+                )
+            _assert_directory_identity_matches(
+                expected_identity,
+                current_identity,
+                "since the state manifest was written",
+            )
+    if schema in {LEGACY_STATE_SCHEMA, PREVIOUS_STATE_SCHEMA}:
         print(
-            "WARN: legacy installer state v1 was validated and will be migrated "
-            "to state v2 by the next successful write"
+            f"WARN: legacy installer state {schema.rsplit('/', 1)[-1]} was validated "
+            "and will be migrated to state v3 by the next successful write"
         )
     return value
 
@@ -1109,6 +1260,15 @@ def _parent_directories(relative: str) -> list[str]:
     return [Path(*parts[:index]).as_posix() for index in range(1, len(parts) + 1)]
 
 
+def _action_directory_paths(actions: list[Action]) -> set[str]:
+    directories: set[str] = set()
+    for action in actions:
+        directories.update(_parent_directories(action.path))
+        if action.backup is not None:
+            directories.update(_parent_directories(action.backup))
+    return directories
+
+
 def _eligible_rollback_directories(actions: list[Action]) -> set[str]:
     eligible: set[str] = set()
     for action in actions:
@@ -1121,6 +1281,104 @@ def _eligible_rollback_directories(actions: list[Action]) -> set[str]:
 
 def _canonical_directory_order(directories: set[str]) -> list[str]:
     return sorted(directories, key=lambda relative: (len(Path(relative).parts), relative))
+
+
+def _snapshot_directory_records(
+    adapter: RepositoryAdapter, actions: list[Action]
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for relative in _canonical_directory_order(_action_directory_paths(actions)):
+        normalized = adapter.normalize(relative)
+        identity = adapter.directory_identity(normalized)
+        records.append(
+            {
+                "path": normalized,
+                "identity": identity,
+                "created": False,
+                "prepared": identity is not None,
+            }
+        )
+    return records
+
+
+def _validate_directory_records(
+    adapter: RepositoryAdapter,
+    value: Any,
+    actions: list[Action],
+    journal_phase: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise WorkflowError("Transaction journal directories are malformed")
+    expected_paths = _canonical_directory_order(_action_directory_paths(actions))
+    records: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {
+            "path", "identity", "created", "prepared"
+        }:
+            raise WorkflowError("Transaction journal directory record is malformed")
+        relative = item.get("path")
+        if not isinstance(relative, str) or adapter.normalize(relative) != relative:
+            raise WorkflowError("Transaction journal directory path is malformed")
+        if type(item.get("created")) is not bool or type(item.get("prepared")) is not bool:
+            raise WorkflowError("Transaction journal directory ownership is malformed")
+        prepared = item["prepared"]
+        identity = item.get("identity")
+        if prepared:
+            identity = _validate_root_identity(identity)
+        elif identity is not None or item["created"]:
+            raise WorkflowError("Incomplete directory preparation record is malformed")
+        records.append(
+            {
+                "path": relative,
+                "identity": identity,
+                "created": item["created"],
+                "prepared": prepared,
+            }
+        )
+    if [record["path"] for record in records] != expected_paths:
+        raise WorkflowError("Transaction journal directories are not canonical")
+    if journal_phase != "preparingDirectories" and any(
+        not record["prepared"] for record in records
+    ):
+        raise WorkflowError("Transaction journal has incomplete directory preparation")
+    return records
+
+
+def _assert_directory_records(
+    adapter: RepositoryAdapter,
+    records: list[dict[str, Any]],
+    context: str,
+    allow_missing_created: bool = False,
+    allow_missing: bool = False,
+    known_missing_directories: set[str] | None = None,
+) -> set[str]:
+    missing = set(known_missing_directories or set())
+    for record in records:
+        if not record["prepared"]:
+            raise WorkflowError(
+                "Transaction journal has incomplete directory preparation; "
+                "retain it for manual recovery"
+            )
+        if _is_within_missing_directory(record["path"], missing):
+            continue
+        current = adapter.directory_identity(record["path"])
+        if current is None:
+            if allow_missing or (allow_missing_created and record["created"]):
+                missing.add(record["path"])
+                continue
+            raise WorkflowError(
+                f"Managed directory is missing {context}: {record['path']}"
+            )
+        _assert_directory_identity_matches(record["identity"], current, context)
+    return missing
+
+
+def _is_within_missing_directory(relative: str, missing_directories: set[str]) -> bool:
+    parts = Path(relative).parts
+    return any(
+        parts[: len(Path(missing).parts)] == Path(missing).parts
+        for missing in missing_directories
+    )
 
 
 def _plan_rollback_directories(
@@ -1161,8 +1419,19 @@ def _journal_value(
     created_at: str | None = None,
     root_identity: dict[str, str] | None = None,
     rollback_directories: list[str] | None = None,
+    directories: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    identity = root_identity or _repository_adapter(target).root_identity
+    repository: RepositoryAdapter | None = None
+    if root_identity is None or directories is None:
+        repository = _repository_adapter(target)
+    identity = root_identity or repository.root_identity
+    directory_values = list(directories) if directories is not None else list(
+        _snapshot_directory_records(repository, actions)
+    )
+    if directories is None and rollback_directories is not None:
+        owned = set(rollback_directories)
+        for record in directory_values:
+            record["created"] = record["path"] in owned
     return {
         "schema": JOURNAL_SCHEMA,
         "transactionId": transaction_id,
@@ -1172,6 +1441,7 @@ def _journal_value(
         "createdAt": created_at or _now(),
         "phase": phase,
         "rollbackDirectories": list(rollback_directories or []),
+        "directories": directory_values,
         "actions": [action.to_json() for action in actions],
     }
 
@@ -1181,16 +1451,25 @@ def _parse_journal(
     value: Any,
     adapter: RepositoryAdapter | None = None,
     expected_root_identity: dict[str, str] | None = None,
-) -> tuple[str, str, str, str, list[Action], list[str]]:
+) -> tuple[
+    str,
+    str,
+    str,
+    str,
+    list[Action],
+    list[str],
+    list[dict[str, Any]],
+]:
     if not isinstance(value, dict):
         raise WorkflowError("Transaction journal has an incomplete or unknown root schema")
-    if value.get("schema") in {LEGACY_JOURNAL_SCHEMA, OLDER_JOURNAL_SCHEMA}:
+    if value.get("schema") in {LEGACY_JOURNAL_SCHEMA, *OLDER_JOURNAL_SCHEMAS}:
         raise WorkflowError("Legacy transaction journal requires manual recovery")
     if value.get("schema") != JOURNAL_SCHEMA:
         raise WorkflowError("Legacy or unsupported transaction journal requires manual recovery")
     root_keys = {
         "schema", "transactionId", "operation", "target", "rootIdentity", "createdAt",
         "phase", "rollbackDirectories", "actions",
+        "directories",
     }
     action_keys = {
         "index", "kind", "path", "owner", "created", "backup", "preHash", "postHash",
@@ -1220,7 +1499,9 @@ def _parse_journal(
     if parsed_created_at is None or parsed_created_at.tzinfo is None:
         raise WorkflowError("Transaction journal has an invalid createdAt")
     journal_phase = value.get("phase")
-    if journal_phase not in {"prepared", "applying", "rollingBack", "committed"}:
+    if journal_phase not in {
+        "preparingDirectories", "prepared", "applying", "rollingBack", "committed"
+    }:
         raise WorkflowError("Transaction journal has an invalid phase")
     items = value.get("actions")
     if not isinstance(items, list) or not items:
@@ -1288,6 +1569,19 @@ def _parse_journal(
     rollback_directories = _validate_rollback_directories(
         repository, value.get("rollbackDirectories"), actions
     )
+    directory_records = _validate_directory_records(
+        repository, value.get("directories"), actions, journal_phase
+    )
+    if journal_phase != "preparingDirectories" or all(
+        record["prepared"] for record in directory_records
+    ):
+        created_directories = [
+            record["path"] for record in directory_records if record["created"]
+        ]
+        if created_directories != rollback_directories:
+            raise WorkflowError(
+                "Transaction journal directory ownership does not match rollbackDirectories"
+            )
     return (
         transaction_id,
         operation,
@@ -1295,12 +1589,13 @@ def _parse_journal(
         journal_phase,
         actions,
         rollback_directories,
+        directory_records,
     )
 
 
 def _read_journal(
     target: Path, journal_path: Path
-) -> tuple[str, str, str, str, list[Action], list[str]]:
+) -> tuple[str, str, str, str, list[Action], list[str], list[dict[str, Any]]]:
     adapter = _repository_adapter(target)
     return _read_relative_journal(adapter, _relative(target, journal_path))
 
@@ -1309,7 +1604,7 @@ def _read_relative_journal(
     adapter: RepositoryAdapter,
     journal_relative: str,
     expected_root_identity: dict[str, str] | None = None,
-) -> tuple[str, str, str, str, list[Action], list[str]]:
+) -> tuple[str, str, str, str, list[Action], list[str], list[dict[str, Any]]]:
     journal_relative = adapter.normalize(journal_relative)
     try:
         value = json.loads(adapter.read_bytes(journal_relative).decode("utf-8"))
@@ -1321,18 +1616,39 @@ def _read_relative_journal(
     return _parse_journal(adapter.root, value, adapter, expected_root_identity)
 
 
-def _classify_actions(adapter: RepositoryAdapter, actions: list[Action]) -> dict[int, str]:
+def _classify_actions(
+    adapter: RepositoryAdapter,
+    actions: list[Action],
+    missing_directories: set[str] | None = None,
+) -> dict[int, str]:
     classifications: dict[int, str] = {}
     errors: list[str] = []
+    missing = missing_directories or set()
     for action in actions:
+        if _is_within_missing_directory(action.path, missing):
+            if action.created and action.pre_hash is None:
+                classifications[action.index] = "pre"
+            else:
+                errors.append(
+                    "required action pre-state is beneath a missing directory: "
+                    f"{action.path}"
+                )
+            continue
         try:
             current_hash = adapter.hash_file(action.path)
             if (
                 current_hash == action.post_hash
                 and action.backup is not None
-                and adapter.hash_file(action.backup) != action.backup_hash
             ):
-                errors.append(f"backup is missing or tampered: {adapter.display(action.backup)}")
+                if _is_within_missing_directory(action.backup, missing):
+                    errors.append(
+                        "required backup is beneath a missing directory: "
+                        f"{action.backup}"
+                    )
+                elif adapter.hash_file(action.backup) != action.backup_hash:
+                    errors.append(
+                        f"backup is missing or tampered: {adapter.display(action.backup)}"
+                    )
             if current_hash == action.pre_hash:
                 classifications[action.index] = "pre"
             elif current_hash == action.post_hash:
@@ -1358,6 +1674,138 @@ def _apply_actions(
     )
 
 
+def _state_directory_paths(value: dict[str, Any]) -> list[str]:
+    candidates: set[str] = set()
+    for relative in value.get("createdDirectories", []):
+        if isinstance(relative, str):
+            candidates.add(relative)
+    for relative in value.get("files", {}):
+        candidates.update(_parent_directories(relative))
+    agents = value.get("agents")
+    if isinstance(agents, dict) and isinstance(agents.get("path"), str):
+        candidates.update(_parent_directories(agents["path"]))
+    for relative in value.get("backups", []):
+        if isinstance(relative, str):
+            candidates.update(_parent_directories(relative))
+    return _canonical_directory_order(candidates)
+
+
+def _finalize_state_directory_identities(
+    adapter: RepositoryAdapter, actions: list[Action]
+) -> None:
+    for action in actions:
+        if action.path != STATE_FILENAME or action.kind != "write":
+            continue
+        if action.content is None:
+            raise WorkflowError("State manifest action has no content")
+        try:
+            value = json.loads(action.content.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise WorkflowError("State manifest action content is malformed") from error
+        if not isinstance(value, dict) or value.get("schema") != SCHEMA:
+            raise WorkflowError("State manifest action does not use the current schema")
+        identities: dict[str, dict[str, str]] = {}
+        for relative in _state_directory_paths(value):
+            identity = adapter.directory_identity(relative)
+            if identity is None:
+                raise WorkflowError(
+                    f"Managed directory is missing before state persistence: {relative}"
+                )
+            identities[relative] = _validate_root_identity(identity)
+        value["directoryIdentities"] = identities
+        action.content = (
+            json.dumps(value, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        action.post_hash = _sha256_bytes(action.content)
+
+
+def _prepare_transaction_directories(
+    adapter: RepositoryAdapter,
+    journal_relative: str,
+    transaction_id: str,
+    operation: str,
+    created_at: str,
+    actions: list[Action],
+    root_identity: dict[str, str],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    records = _snapshot_directory_records(adapter, actions)
+    rollback_directories: list[str] = []
+    _write_relative_json(
+        adapter,
+        journal_relative,
+        _journal_value(
+            adapter.root,
+            transaction_id,
+            operation,
+            actions,
+            "preparingDirectories",
+            created_at,
+            root_identity,
+            rollback_directories,
+            records,
+        ),
+        root_identity,
+    )
+    parsed = _read_relative_journal(adapter, journal_relative, root_identity)
+    if parsed[0] != transaction_id or parsed[1] != operation or parsed[6] != records:
+        raise WorkflowError("Transaction journal verification failed before directory preparation")
+    for record in records:
+        if record["prepared"]:
+            continue
+        identity, created = adapter.mkdir(record["path"], expected_absent=True)
+        if not created:
+            raise WorkflowError(
+                f"Managed directory expected to be absent was opened: {record['path']}"
+            )
+        record["identity"] = _validate_root_identity(identity)
+        record["created"] = True
+        record["prepared"] = True
+        rollback_directories.append(record["path"])
+        _write_relative_json(
+            adapter,
+            journal_relative,
+            _journal_value(
+                adapter.root,
+                transaction_id,
+                operation,
+                actions,
+                "preparingDirectories",
+                created_at,
+                root_identity,
+                rollback_directories,
+                records,
+            ),
+            root_identity,
+        )
+    _assert_directory_records(adapter, records, "after directory preparation")
+    _finalize_state_directory_identities(adapter, actions)
+    _write_relative_json(
+        adapter,
+        journal_relative,
+        _journal_value(
+            adapter.root,
+            transaction_id,
+            operation,
+            actions,
+            "prepared",
+            created_at,
+            root_identity,
+            rollback_directories,
+            records,
+        ),
+        root_identity,
+    )
+    parsed = _read_relative_journal(adapter, journal_relative, root_identity)
+    if (
+        parsed[0] != transaction_id
+        or parsed[1] != operation
+        or parsed[5] != rollback_directories
+        or parsed[6] != records
+    ):
+        raise WorkflowError("Transaction journal verification failed before apply")
+    return rollback_directories, records
+
+
 def _apply_relative_actions(
     adapter: RepositoryAdapter,
     journal_relative: str,
@@ -1369,32 +1817,19 @@ def _apply_relative_actions(
         return
     created_at = _now()
     root_identity = _validate_root_identity(adapter.root_identity)
-    rollback_directories = _plan_rollback_directories(adapter, actions)
-    _write_relative_json(
+    rollback_directories, directory_records = _prepare_transaction_directories(
         adapter,
         journal_relative,
-        _journal_value(
-            adapter.root, transaction_id, operation, actions, "prepared", created_at,
-            root_identity, rollback_directories,
-        ),
+        transaction_id,
+        operation,
+        created_at,
+        actions,
         root_identity,
     )
-    (
-        parsed_id,
-        parsed_operation,
-        _,
-        _,
-        parsed_actions,
-        parsed_rollback_directories,
-    ) = _read_relative_journal(
+    parsed_actions = _read_relative_journal(
         adapter, journal_relative, root_identity
-    )
-    if (
-        parsed_id != transaction_id
-        or parsed_operation != operation
-        or parsed_rollback_directories != rollback_directories
-    ):
-        raise WorkflowError("Transaction journal verification failed before apply")
+    )[4]
+    _assert_directory_records(adapter, directory_records, "before backup creation")
     _assert_current_root_identity(adapter, root_identity, "before backup creation")
     _prepare_backups(adapter, actions)
     _classify_actions(adapter, parsed_actions)
@@ -1406,7 +1841,7 @@ def _apply_relative_actions(
             action.phase = "applying"
             _write_relative_json(adapter, journal_relative, _journal_value(
                 adapter.root, transaction_id, operation, actions, "applying", created_at,
-                root_identity, rollback_directories,
+                root_identity, rollback_directories, directory_records,
             ), root_identity)
             if action.kind == "write":
                 if action.content is None:
@@ -1423,11 +1858,11 @@ def _apply_relative_actions(
             action.phase = "applied"
             _write_relative_json(adapter, journal_relative, _journal_value(
                 adapter.root, transaction_id, operation, actions, "applying", created_at,
-                root_identity, rollback_directories,
+                root_identity, rollback_directories, directory_records,
             ), root_identity)
     except Exception:
         try:
-            _rollback_relative_actions(
+            missing_directories = _rollback_relative_actions(
                 adapter,
                 journal_relative,
                 transaction_id,
@@ -1436,6 +1871,7 @@ def _apply_relative_actions(
                 actions,
                 root_identity,
                 rollback_directories,
+                directory_records,
             )
         except Exception as rollback_error:
             raise WorkflowError(
@@ -1449,11 +1885,13 @@ def _apply_relative_actions(
             actions,
             rollback_directories,
             root_identity,
+            directory_records,
+            missing_directories,
         )
         raise
     _write_relative_json(adapter, journal_relative, _journal_value(
         adapter.root, transaction_id, operation, actions, "committed", created_at,
-        root_identity, rollback_directories,
+        root_identity, rollback_directories, directory_records,
     ), root_identity)
 
 
@@ -1474,11 +1912,14 @@ def _discard_transaction_backups(
     adapter: RepositoryAdapter,
     actions: list[Action],
     expected_root_identity: dict[str, str] | None = None,
+    missing_directories: set[str] | None = None,
 ) -> None:
     if expected_root_identity is not None:
         _assert_current_root_identity(adapter, expected_root_identity, "before backup cleanup")
     for action in actions:
-        if action.backup is not None:
+        if action.backup is not None and not _is_within_missing_directory(
+            action.backup, missing_directories or set()
+        ):
             adapter.unlink(action.backup, missing_ok=True)
 
 
@@ -1486,13 +1927,25 @@ def _remove_rollback_directories(
     adapter: RepositoryAdapter,
     rollback_directories: list[str],
     expected_root_identity: dict[str, str],
+    directory_records: list[dict[str, Any]] | None = None,
+    missing_directories: set[str] | None = None,
 ) -> None:
     _assert_current_root_identity(
         adapter, expected_root_identity, "before rollback directory cleanup"
     )
+    records = directory_records or _snapshot_directory_records(adapter, [])
+    identities = {
+        record["path"]: record["identity"]
+        for record in records
+        if record.get("prepared")
+    }
     for relative in reversed(rollback_directories):
+        if _is_within_missing_directory(
+            relative, missing_directories or set()
+        ):
+            continue
         try:
-            adapter.rmdir(relative)
+            adapter.rmdir(relative, identities.get(relative))
         except OSError as error:
             if getattr(error, "winerror", None) == 145 or error.errno in {
                 errno.ENOTEMPTY,
@@ -1508,10 +1961,18 @@ def _complete_rollback_cleanup(
     actions: list[Action],
     rollback_directories: list[str],
     expected_root_identity: dict[str, str],
+    directory_records: list[dict[str, Any]] | None = None,
+    missing_directories: set[str] | None = None,
 ) -> None:
-    _discard_transaction_backups(adapter, actions, expected_root_identity)
+    _discard_transaction_backups(
+        adapter, actions, expected_root_identity, missing_directories
+    )
     _remove_rollback_directories(
-        adapter, rollback_directories, expected_root_identity
+        adapter,
+        rollback_directories,
+        expected_root_identity,
+        directory_records,
+        missing_directories,
     )
     _assert_current_root_identity(
         adapter, expected_root_identity, "before rollback journal cleanup"
@@ -1549,18 +2010,31 @@ def _rollback_relative_actions(
     actions: list[Action],
     root_identity: dict[str, str] | None = None,
     rollback_directories: list[str] | None = None,
-) -> None:
+    directory_records: list[dict[str, Any]] | None = None,
+    missing_directories: set[str] | None = None,
+) -> set[str]:
     transaction_identity = _validate_root_identity(root_identity or adapter.root_identity)
     directories = (
         list(rollback_directories)
         if rollback_directories is not None
         else _plan_rollback_directories(adapter, actions)
     )
+    records = directory_records or _snapshot_directory_records(adapter, actions)
+    if directory_records is None:
+        for record in records:
+            record["created"] = record["path"] in directories
     _assert_current_root_identity(adapter, transaction_identity, "before rollback")
-    classifications = _classify_actions(adapter, actions)
+    missing = _assert_directory_records(
+        adapter,
+        records,
+        "before rollback",
+        allow_missing_created=True,
+        known_missing_directories=missing_directories,
+    )
+    classifications = _classify_actions(adapter, actions, missing)
     _write_relative_json(adapter, journal_relative, _journal_value(
         adapter.root, transaction_id, operation, actions, "rollingBack", created_at,
-        transaction_identity, directories,
+        transaction_identity, directories, records,
     ), transaction_identity)
     for action in reversed(actions):
         _assert_current_root_identity(adapter, transaction_identity, "before rolling back an action")
@@ -1568,13 +2042,13 @@ def _rollback_relative_actions(
             action.phase = "rolledBack"
             _write_relative_json(adapter, journal_relative, _journal_value(
                 adapter.root, transaction_id, operation, actions, "rollingBack", created_at,
-                transaction_identity, directories,
+                transaction_identity, directories, records,
             ), transaction_identity)
             continue
         action.phase = "rollingBack"
         _write_relative_json(adapter, journal_relative, _journal_value(
             adapter.root, transaction_id, operation, actions, "rollingBack", created_at,
-            transaction_identity, directories,
+            transaction_identity, directories, records,
         ), transaction_identity)
         if action.created:
             if adapter.hash_file(action.path) != action.post_hash:
@@ -1597,8 +2071,9 @@ def _rollback_relative_actions(
         action.phase = "rolledBack"
         _write_relative_json(adapter, journal_relative, _journal_value(
             adapter.root, transaction_id, operation, actions, "rollingBack", created_at,
-            transaction_identity, directories,
+            transaction_identity, directories, records,
         ), transaction_identity)
+    return missing
 
 
 def _recover_with_adapter(
@@ -1616,40 +2091,69 @@ def _recover_with_adapter(
         journal_phase,
         actions,
         rollback_directories,
+        directory_records,
     ) = _read_relative_journal(adapter, journal_relative, root_identity)
+    if any(not record["prepared"] for record in directory_records):
+        raise WorkflowError(
+            "Directory preparation is incomplete; retain the journal for manual recovery"
+        )
+    missing_directories = _assert_directory_records(
+        adapter,
+        directory_records,
+        "during recovery",
+        allow_missing_created=journal_phase == "rollingBack",
+        allow_missing=journal_phase == "committed",
+    )
     if journal_phase == "committed":
         if dry_run:
             print("DRY-RUN: would finalize committed transaction cleanup")
             return
         if operation == "uninstall":
             _assert_current_root_identity(adapter, root_identity, "before committed cleanup")
-            state_backup = _state_action_backup(target, actions, adapter)
+            state_backup = _state_action_backup(
+                target, actions, adapter, missing_directories
+            )
             previous_state = _read_state(
-                adapter.display(state_backup), target, adapter, root_identity, allow_legacy=True
+                adapter.display(state_backup),
+                target,
+                adapter,
+                root_identity,
+                allow_legacy=True,
+                validate_directories=False,
             )
             if previous_state is None:
                 raise WorkflowError("Committed uninstall state backup is unavailable")
             _finalize_committed_uninstall(
-                target, journal_path, actions, previous_state, adapter, root_identity
+                target,
+                journal_path,
+                actions,
+                previous_state,
+                adapter,
+                root_identity,
+                missing_directories,
             )
         else:
             _cleanup_backup_files(
-                target, _install_commit_cleanup_paths(target, actions), adapter, root_identity
+                target,
+                _install_commit_cleanup_paths(target, actions),
+                adapter,
+                root_identity,
+                missing_directories,
             )
             _assert_current_root_identity(adapter, root_identity, "before journal cleanup")
             adapter.unlink(journal_relative, missing_ok=True)
         print("RECOVERED: committed transaction cleanup finalized")
         return
-    classifications = _classify_actions(adapter, actions)
+    classifications = _classify_actions(adapter, actions, missing_directories)
     if dry_run:
         print(
             "DRY-RUN: would roll back "
             f"{sum(state == 'post' for state in classifications.values())} applied action(s)"
         )
         return
-    _rollback_relative_actions(
+    rollback_missing_directories = _rollback_relative_actions(
         adapter, journal_relative, transaction_id, operation, created_at, actions,
-        root_identity, rollback_directories,
+        root_identity, rollback_directories, directory_records, missing_directories,
     )
     _complete_rollback_cleanup(
         adapter,
@@ -1657,6 +2161,8 @@ def _recover_with_adapter(
         actions,
         rollback_directories,
         root_identity,
+        directory_records,
+        rollback_missing_directories,
     )
     print("RECOVERED: interrupted transaction rolled back")
 
@@ -1724,7 +2230,7 @@ def _install_with_adapter(
         directory_candidates.extend([".codex", ".codex/agents"])
     created_directories = list(old_state.get("createdDirectories", [])) if old_state else []
     for relative in directory_candidates:
-        if relative not in created_directories and not adapter.exists(relative):
+        if relative not in created_directories and adapter.directory_identity(relative) is None:
             created_directories.append(relative)
 
     for source_relative, installed_relative in all_files:
@@ -1846,6 +2352,11 @@ def _install_with_adapter(
         "agents": agents_record,
         "backups": sorted(referenced_backups),
         "createdDirectories": created_directories,
+        "directoryIdentities": (
+            dict(old_state.get("directoryIdentities", {}))
+            if old_state and old_state.get("schema") == SCHEMA
+            else {}
+        ),
         "features": {
             "customAgents": any(
                 relative.startswith(".codex/agents/") for relative in new_files
@@ -1866,6 +2377,7 @@ def _install_with_adapter(
                 "agents",
                 "backups",
                 "createdDirectories",
+                "directoryIdentities",
                 "features",
             )
         }
@@ -1942,6 +2454,8 @@ def _remove_empty_managed_directories(
     created_directories: list[str],
     adapter: RepositoryAdapter | None = None,
     expected_root_identity: dict[str, str] | None = None,
+    directory_identities: dict[str, dict[str, str]] | None = None,
+    missing_directories: set[str] | None = None,
 ) -> None:
     repository = adapter or _repository_adapter(target)
     if expected_root_identity is not None:
@@ -1957,8 +2471,15 @@ def _remove_empty_managed_directories(
     }
     candidates.update(repository.normalize(relative) for relative in created_directories)
     for candidate in sorted(candidates, key=lambda value: len(Path(value).parts), reverse=True):
+        if _is_within_missing_directory(candidate, missing_directories or set()):
+            continue
         try:
-            repository.rmdir(candidate)
+            expected = (
+                directory_identities.get(candidate)
+                if directory_identities is not None
+                else None
+            )
+            repository.rmdir(candidate, expected)
         except OSError:
             pass
 
@@ -1968,6 +2489,7 @@ def _cleanup_backup_files(
     backup_paths: list[str | Path],
     adapter: RepositoryAdapter | None = None,
     expected_root_identity: dict[str, str] | None = None,
+    missing_directories: set[str] | None = None,
 ) -> None:
     repository = adapter or _repository_adapter(target)
     if expected_root_identity is not None:
@@ -1985,6 +2507,8 @@ def _cleanup_backup_files(
             raise WorkflowError(
                 f"Backup path escapes the managed backup directory: {repository.display(relative)}"
             )
+        if _is_within_missing_directory(relative, missing_directories or set()):
+            continue
         repository.unlink(relative, missing_ok=True)
         current = Path(relative).parent
         while current != Path("."):
@@ -1994,6 +2518,8 @@ def _cleanup_backup_files(
                 break
             current = current.parent
     for parent in sorted(parents, key=lambda value: len(Path(value).parts), reverse=True):
+        if _is_within_missing_directory(parent, missing_directories or set()):
+            continue
         try:
             repository.rmdir(parent)
         except OSError:
@@ -2001,13 +2527,20 @@ def _cleanup_backup_files(
 
 
 def _state_action_backup(
-    target: Path, actions: list[Action], adapter: RepositoryAdapter | None = None
+    target: Path,
+    actions: list[Action],
+    adapter: RepositoryAdapter | None = None,
+    missing_directories: set[str] | None = None,
 ) -> str:
     repository = adapter or _repository_adapter(target)
     state_actions = [action for action in actions if action.path == STATE_FILENAME]
     if len(state_actions) != 1 or state_actions[0].backup is None:
         raise WorkflowError("Committed transaction lacks its verified state backup")
     state_action = state_actions[0]
+    if _is_within_missing_directory(
+        state_action.backup, missing_directories or set()
+    ):
+        raise WorkflowError("Committed transaction state backup is missing or tampered")
     if repository.hash_file(state_action.backup) != state_action.backup_hash:
         raise WorkflowError("Committed transaction state backup is missing or tampered")
     return state_action.backup
@@ -2032,13 +2565,16 @@ def _finalize_committed_uninstall(
     previous_state: dict[str, Any],
     adapter: RepositoryAdapter | None = None,
     expected_root_identity: dict[str, str] | None = None,
+    missing_directories: set[str] | None = None,
 ) -> None:
     repository = adapter or _repository_adapter(target)
     root_identity = _validate_root_identity(
         expected_root_identity or repository.root_identity
     )
     _assert_current_root_identity(repository, root_identity, "before uninstall cleanup")
-    state_backup = _state_action_backup(target, actions, repository)
+    state_backup = _state_action_backup(
+        target, actions, repository, missing_directories
+    )
     committed_state = _read_state(
         repository.display(STATE_FILENAME), target, repository, root_identity,
         allow_legacy=False,
@@ -2053,17 +2589,31 @@ def _finalize_committed_uninstall(
         for backup in previous_state["backups"]
         if backup not in retained_backups
     ]
-    _cleanup_backup_files(target, prerequisites, repository, root_identity)
+    _cleanup_backup_files(
+        target,
+        prerequisites,
+        repository,
+        root_identity,
+        missing_directories,
+    )
     _remove_empty_managed_directories(
         target,
         list(previous_state["createdDirectories"]),
         repository,
         root_identity,
+        previous_state.get("directoryIdentities"),
+        missing_directories,
     )
     _assert_current_root_identity(repository, root_identity, "before journal cleanup")
     repository.unlink(_relative(target, journal_path), missing_ok=True)
     try:
-        _cleanup_backup_files(target, [state_backup], repository, root_identity)
+        _cleanup_backup_files(
+            target,
+            [state_backup],
+            repository,
+            root_identity,
+            missing_directories,
+        )
     except (OSError, WorkflowError):
         pass
 
@@ -2146,6 +2696,21 @@ def _uninstall_with_adapter(
         updated_state["files"] = remaining_files
         updated_state["agents"] = remaining_agents
         updated_state["backups"] = sorted(remaining_backups)
+        retained_paths = {
+            parent
+            for relative in remaining_files
+            for parent in _parent_directories(relative)
+        }
+        if remaining_agents is not None:
+            retained_paths.update(
+                _parent_directories(remaining_agents.get("path", "AGENTS.md"))
+            )
+        updated_state["createdDirectories"] = [
+            relative
+            for relative in state["createdDirectories"]
+            if relative in retained_paths
+        ]
+        updated_state["directoryIdentities"] = {}
         updated_state["updatedAt"] = _now()
         updated_state["transactionId"] = transaction_id
         state_content = (json.dumps(updated_state, indent=2, sort_keys=True) + "\n").encode("utf-8")

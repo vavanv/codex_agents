@@ -18,6 +18,23 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 import workflow_manager as manager
 
 
+def prepare_directory_metadata(
+    adapter: manager.RepositoryAdapter, actions: list[manager.Action]
+) -> tuple[list[str], list[dict[str, object]]]:
+    records = manager._snapshot_directory_records(adapter, actions)
+    rollback_directories: list[str] = []
+    for record in records:
+        if record["prepared"]:
+            continue
+        identity, created = adapter.mkdir(record["path"], expected_absent=True)
+        record["identity"] = identity
+        record["created"] = created
+        record["prepared"] = True
+        if created:
+            rollback_directories.append(record["path"])
+    return rollback_directories, records
+
+
 @unittest.skipUnless(sys.platform == "win32", "Windows native activation only")
 class WindowsAdapterActivationTests(unittest.TestCase):
     def open_native(self, target: Path) -> manager.WindowsRepositoryAdapter:
@@ -112,6 +129,9 @@ class WindowsAdapterActivationTests(unittest.TestCase):
                 transaction_id,
                 [("write", relative, b"after")],
             )
+            rollback_directories, directory_records = prepare_directory_metadata(
+                path_adapter, actions
+            )
             manager._write_relative_json(
                 path_adapter,
                 manager.JOURNAL_FILENAME,
@@ -121,6 +141,8 @@ class WindowsAdapterActivationTests(unittest.TestCase):
                     "install",
                     actions,
                     root_identity=path_adapter.root_identity,
+                    rollback_directories=rollback_directories,
+                    directories=directory_records,
                 ),
                 path_adapter.root_identity,
             )
@@ -296,6 +318,9 @@ class RecoveryOutputContractTests(unittest.TestCase):
         phase: str,
         actions: list[manager.Action],
     ) -> None:
+        rollback_directories, directory_records = prepare_directory_metadata(
+            adapter, actions
+        )
         manager._write_relative_json(
             adapter,
             manager.JOURNAL_FILENAME,
@@ -306,6 +331,8 @@ class RecoveryOutputContractTests(unittest.TestCase):
                 actions,
                 phase=phase,
                 root_identity=adapter.root_identity,
+                rollback_directories=rollback_directories,
+                directories=directory_records,
             ),
             adapter.root_identity,
         )

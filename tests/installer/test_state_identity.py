@@ -40,6 +40,15 @@ class StateIdentityTests(unittest.TestCase):
         value = self.read_state(target)
         value["schema"] = manager.LEGACY_STATE_SCHEMA
         value.pop("rootIdentity")
+        value.pop("directoryIdentities")
+        content = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        self.state_path(target).write_bytes(content)
+        return content
+
+    def make_v2_state(self, target: Path) -> bytes:
+        value = self.read_state(target)
+        value["schema"] = manager.PREVIOUS_STATE_SCHEMA
+        value.pop("directoryIdentities")
         content = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
         self.state_path(target).write_bytes(content)
         return content
@@ -119,7 +128,7 @@ class StateIdentityTests(unittest.TestCase):
                 "during mismatched transition",
             )
 
-    def test_fresh_install_writes_state_v2_and_journal_v4_identity(self) -> None:
+    def test_fresh_install_writes_state_v3_and_journal_v5_identities(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory)
             captured: list[dict[str, object]] = []
@@ -143,15 +152,20 @@ class StateIdentityTests(unittest.TestCase):
             self.assertEqual(
                 manager.PathRepositoryAdapter(target).root_identity, state["rootIdentity"]
             )
+            self.assertTrue(state["directoryIdentities"])
             self.assertTrue(captured)
             identities = {json.dumps(item["rootIdentity"], sort_keys=True) for item in captured}
             self.assertEqual(1, len(identities))
-            rollback_lists = {
-                json.dumps(item["rollbackDirectories"], sort_keys=True)
-                for item in captured
-            }
-            self.assertEqual(1, len(rollback_lists))
-            self.assertTrue(captured[0]["rollbackDirectories"])
+            self.assertEqual("preparingDirectories", captured[0]["phase"])
+            self.assertEqual([], captured[0]["rollbackDirectories"])
+            self.assertTrue(captured[0]["directories"])
+            self.assertTrue(
+                any(not item["prepared"] for item in captured[0]["directories"])
+            )
+            self.assertTrue(captured[-1]["rollbackDirectories"])
+            self.assertTrue(
+                all(item["prepared"] for item in captured[-1]["directories"])
+            )
             self.assertTrue(all(item["schema"] == manager.JOURNAL_SCHEMA for item in captured))
             self.assertEqual(state["rootIdentity"], captured[0]["rootIdentity"])
 
@@ -213,6 +227,80 @@ class StateIdentityTests(unittest.TestCase):
             legacy = self.make_legacy_state(dry)
             self.uninstall(dry, True)
             self.assertEqual(legacy, self.state_path(dry).read_bytes())
+
+    def test_valid_v2_reinstall_and_partial_uninstall_migrate_transactionally(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reinstall = root / "reinstall"
+            reinstall.mkdir()
+            self.install(reinstall)
+            self.make_v2_state(reinstall)
+            output = self.install(reinstall)
+            self.assertIn("legacy installer state v2", output)
+            self.assertEqual(manager.SCHEMA, self.read_state(reinstall)["schema"])
+            self.assertTrue(self.read_state(reinstall)["directoryIdentities"])
+
+            partial = root / "partial"
+            partial.mkdir()
+            self.install(partial)
+            modified = partial / "docs" / "ai" / "PROJECT_CONTEXT.md"
+            modified.write_bytes(modified.read_bytes() + b"\nproject edit\n")
+            self.make_v2_state(partial)
+            self.uninstall(partial)
+            state = self.read_state(partial)
+            self.assertEqual(manager.SCHEMA, state["schema"])
+            self.assertTrue(state["directoryIdentities"])
+
+    def test_state_directory_identity_mismatch_blocks_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            self.install(target)
+            value = self.read_state(target)
+            relative = next(iter(value["directoryIdentities"]))
+            value["directoryIdentities"][relative] = self.different_identity(
+                value["directoryIdentities"][relative]
+            )
+            before = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            self.state_path(target).write_bytes(before)
+            with self.assertRaisesRegex(
+                manager.WorkflowError, "Managed directory identity does not match"
+            ):
+                self.uninstall(target)
+            self.assertEqual(before, self.state_path(target).read_bytes())
+            self.assertFalse((target / manager.JOURNAL_FILENAME).exists())
+
+    def test_incomplete_directory_preparation_retains_evidence_without_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            adapter = manager.PathRepositoryAdapter(target)
+            relative = next(iter(manager.PACKAGE_FILES.values()))
+            actions = manager._prepare_relative_actions(
+                adapter, "e" * 32, [("write", relative, b"content")]
+            )
+            records = manager._snapshot_directory_records(adapter, actions)
+            manager._write_relative_json(
+                adapter,
+                manager.JOURNAL_FILENAME,
+                manager._journal_value(
+                    target,
+                    "e" * 32,
+                    "install",
+                    actions,
+                    phase="preparingDirectories",
+                    root_identity=adapter.root_identity,
+                    rollback_directories=[],
+                    directories=records,
+                ),
+                adapter.root_identity,
+            )
+            journal = target / manager.JOURNAL_FILENAME
+            before = journal.read_bytes()
+            with self.assertRaisesRegex(
+                manager.WorkflowError, "preparation is incomplete"
+            ):
+                manager.recover(target, journal, False, adapter=adapter)
+            self.assertEqual(before, journal.read_bytes())
+            self.assertFalse((target / manager.INSTALL_DIRECTORY).exists())
 
     def test_state_identity_mismatch_blocks_install_and_uninstall_without_mutation(self) -> None:
         for operation in ("install", "uninstall"):

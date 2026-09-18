@@ -20,6 +20,7 @@
     "fspath",
     "ntdll",
     "getwindowsversion",
-    "rereview"
+    "rereview",
+    "transactionally"
   ]
 }

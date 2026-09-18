@@ -1,7 +1,11 @@
 """Production Windows NTFS backend using handle-relative operations.
 
 ``workflow_manager.py`` selects this backend for Windows CLI repository
-lifecycles. Broader adversarial lifecycle validation remains a separate gate.
+lifecycles. The namespace proof begins when each absolute or relative component
+is opened by the kernel: every successfully acquired directory capability is
+kept for the lifecycle, but substitution before a component's first open is
+outside this backend's proof boundary because there is no external identity
+anchor for a not-yet-opened name.
 """
 
 from __future__ import annotations
@@ -46,6 +50,8 @@ FILE_OPEN_REPARSE_POINT = 0x00200000
 FILE_OPEN = 1
 FILE_CREATE = 2
 FILE_OPEN_IF = 3
+FILE_OPENED = 1
+FILE_CREATED = 2
 
 FILE_ATTRIBUTE_TAG_INFO_CLASS = 9
 FILE_ID_INFO_CLASS = 18
@@ -79,6 +85,10 @@ class UnsupportedTargetError(RepositoryFsError):
 
 class ReparsePointError(RepositoryFsError):
     """A repository component is a reparse point."""
+
+
+class DirectoryRaceError(RepositoryFsError):
+    """A directory expected to be absent was opened instead of created."""
 
 
 class UNICODE_STRING(ctypes.Structure):
@@ -306,6 +316,20 @@ class RootIdentity:
     file_id: str
 
 
+@dataclass(frozen=True)
+class DirectoryObservation:
+    relative: str
+    identity: RootIdentity
+    created: bool
+
+
+@dataclass
+class _DirectoryCapability:
+    relative: str
+    handle: SafeHandle
+    identity: RootIdentity
+
+
 class _NativeApi:
     def __init__(self) -> None:
         validate_abi()
@@ -441,6 +465,8 @@ class RepositoryFs:
     def __init__(self, target: str | os.PathLike[str]) -> None:
         self._api = _NativeApi()
         self._root: SafeHandle | None = None
+        self._directories: dict[str, _DirectoryCapability] = {}
+        self._acquisition_handles: list[SafeHandle] = []
         self._drive, parts, self._display_path = _parse_absolute_target(target)
         drive_root = f"{self._drive}:\\"
         drive_type = self._api.GetDriveTypeW(drive_root)
@@ -451,7 +477,7 @@ class RepositoryFs:
         raw = self._api.CreateFileW(
             drive_root,
             FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -479,7 +505,7 @@ class RepositoryFs:
             volume_identity = self._identity_for(current)
             for component in parts:
                 child = self._open_component(current, component, directory=True)
-                current.close()
+                self._acquisition_handles.append(current)
                 current = child
             self._reject_reparse(current)
             identity = self._identity_for(current)
@@ -487,10 +513,14 @@ class RepositoryFs:
                 raise UnsupportedTargetError("Repository and bootstrapped volume identities differ")
             self._identity = identity
             self._root = current
+            self._directories[""] = _DirectoryCapability("", current, identity)
             current = None
         finally:
             if current is not None:
                 current.close()
+            if self._root is None:
+                self._close_handles(self._acquisition_handles)
+                self._acquisition_handles.clear()
 
     @property
     def identity(self) -> RootIdentity:
@@ -542,7 +572,11 @@ class RepositoryFs:
             ctypes.byref(io_status),
             None,
             FILE_ATTRIBUTE_NORMAL,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            (
+                FILE_SHARE_READ | FILE_SHARE_WRITE
+                if directory is True
+                else FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+            ),
             disposition,
             options,
             None,
@@ -557,6 +591,51 @@ class RepositoryFs:
             handle.close()
             raise
         return handle
+
+    def _open_directory_if(
+        self, parent: SafeHandle, name: str
+    ) -> tuple[SafeHandle, bool]:
+        encoded = name.encode("utf-16-le")
+        if len(encoded) > 0xFFFE:
+            raise ValueError("Windows path component is too long")
+        buffer = ctypes.create_unicode_buffer(name)
+        unicode_name = UNICODE_STRING(len(encoded), len(encoded), ctypes.addressof(buffer))
+        attributes = OBJECT_ATTRIBUTES(
+            ctypes.sizeof(OBJECT_ATTRIBUTES),
+            parent.value,
+            ctypes.pointer(unicode_name),
+            OBJ_CASE_INSENSITIVE,
+            None,
+            None,
+        )
+        result = wintypes.HANDLE()
+        io_status = IO_STATUS_BLOCK()
+        status = self._api.NtCreateFile(
+            ctypes.byref(result),
+            FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | DELETE | SYNCHRONIZE,
+            ctypes.byref(attributes),
+            ctypes.byref(io_status),
+            None,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN_IF,
+            FILE_SYNCHRONOUS_IO_NONALERT
+            | FILE_OPEN_REPARSE_POINT
+            | FILE_DIRECTORY_FILE,
+            None,
+            0,
+        )
+        if status < 0:
+            self._api.raise_status(status, f"creating repository component {name!r}")
+        handle = SafeHandle(result.value, self._api.close)
+        try:
+            self._reject_reparse(handle)
+            if io_status.Information not in {FILE_OPENED, FILE_CREATED}:
+                raise RepositoryFsError("NtCreateFile returned an unknown directory result")
+            return handle, io_status.Information == FILE_CREATED
+        except Exception:
+            handle.close()
+            raise
 
     def _reject_reparse(self, handle: SafeHandle) -> None:
         info = FILE_ATTRIBUTE_TAG_INFO()
@@ -581,26 +660,59 @@ class RepositoryFs:
             raise ctypes.WinError(ctypes.get_last_error())
         return RootIdentity(info.VolumeSerialNumber, bytes(info.FileId.Identifier).hex())
 
+    @staticmethod
+    def _directory_key(parts: tuple[str, ...]) -> str:
+        return "/".join(parts)
+
+    def _pin_directory_parts(
+        self, parts: tuple[str, ...]
+    ) -> _DirectoryCapability:
+        self._require_open()
+        deepest = 0
+        capability = self._directories[""]
+        for index in range(len(parts), 0, -1):
+            key = self._directory_key(parts[:index])
+            existing = self._directories.get(key)
+            if existing is not None:
+                deepest = index
+                capability = existing
+                break
+        for index in range(deepest, len(parts)):
+            child = self._open_component(
+                capability.handle,
+                parts[index],
+                directory=True,
+                access=(
+                    FILE_READ_ATTRIBUTES
+                    | FILE_WRITE_ATTRIBUTES
+                    | DELETE
+                    | SYNCHRONIZE
+                ),
+            )
+            key = self._directory_key(parts[: index + 1])
+            try:
+                identity = self._identity_for(child)
+            except Exception:
+                child.close()
+                raise
+            capability = _DirectoryCapability(key, child, identity)
+            self._directories[key] = capability
+        return capability
+
     def _walk_parent(self, relative: str) -> tuple[SafeHandle, str]:
         parts = _normalize_relative(relative)
-        current = self._duplicate_root()
-        try:
-            for component in parts[:-1]:
-                child = self._open_component(current, component, directory=True)
-                current.close()
-                current = child
-            return current, parts[-1]
-        except Exception:
-            current.close()
-            raise
+        parent = self._pin_directory_parts(parts[:-1])
+        return self._duplicate_handle(parent.handle), parts[-1]
 
     def _duplicate_root(self) -> SafeHandle:
-        root = self._require_open()
+        return self._duplicate_handle(self._require_open())
+
+    def _duplicate_handle(self, handle: SafeHandle) -> SafeHandle:
         duplicate = wintypes.HANDLE()
         process = self._api.GetCurrentProcess()
         if not self._api.DuplicateHandle(
             process,
-            root.value,
+            handle.value,
             process,
             ctypes.byref(duplicate),
             0,
@@ -665,22 +777,51 @@ class RepositoryFs:
     def hash_file(self, relative: str) -> str:
         return hashlib.sha256(self.read_bytes(relative)).hexdigest()
 
-    def ensure_directories(self, relative: str) -> None:
+    def directory_identity(self, relative: str) -> RootIdentity:
         parts = _normalize_relative(relative)
-        current = self._duplicate_root()
-        try:
-            for component in parts:
-                child = self._open_component(
-                    current,
-                    component,
-                    directory=True,
-                    access=FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | DELETE | SYNCHRONIZE,
-                    disposition=FILE_OPEN_IF,
+        return self._pin_directory_parts(parts).identity
+
+    def ensure_directory(
+        self, relative: str, *, expected_absent: bool = False
+    ) -> DirectoryObservation:
+        parts = _normalize_relative(relative)
+        key = self._directory_key(parts)
+        cached = self._directories.get(key)
+        if cached is not None:
+            if expected_absent:
+                raise DirectoryRaceError(
+                    "Directory expected to be absent was already pinned"
                 )
-                current.close()
-                current = child
-        finally:
-            current.close()
+            return DirectoryObservation(key, cached.identity, False)
+        parent = self._pin_directory_parts(parts[:-1])
+        child, created = self._open_directory_if(parent.handle, parts[-1])
+        if expected_absent and not created:
+            child.close()
+            raise DirectoryRaceError(
+                "Directory expected to be absent was opened instead of created"
+            )
+        try:
+            identity = self._identity_for(child)
+        except Exception:
+            child.close()
+            raise
+        capability = _DirectoryCapability(key, child, identity)
+        self._directories[key] = capability
+        return DirectoryObservation(key, capability.identity, created)
+
+    def ensure_directories(
+        self, relative: str, *, expected_absent: bool = False
+    ) -> list[DirectoryObservation]:
+        parts = _normalize_relative(relative)
+        observations: list[DirectoryObservation] = []
+        for index in range(1, len(parts) + 1):
+            observations.append(
+                self.ensure_directory(
+                    self._directory_key(parts[:index]),
+                    expected_absent=expected_absent and index == len(parts),
+                )
+            )
+        return observations
 
     def _write_all(self, handle: SafeHandle, content: bytes) -> None:
         offset = 0
@@ -801,6 +942,9 @@ class RepositoryFs:
             raise primary
 
     def _remove(self, relative: str, *, directory: bool, missing_ok: bool) -> None:
+        if directory:
+            self._remove_directory(relative, missing_ok=missing_ok)
+            return
         try:
             parent, leaf = self._walk_parent(relative)
         except OSError as exc:
@@ -824,17 +968,82 @@ class RepositoryFs:
         finally:
             parent.close()
 
+    def _remove_directory(
+        self,
+        relative: str,
+        *,
+        missing_ok: bool,
+        expected_identity: RootIdentity | None = None,
+    ) -> None:
+        parts = _normalize_relative(relative)
+        key = self._directory_key(parts)
+        try:
+            capability = self._pin_directory_parts(parts)
+        except OSError as exc:
+            if missing_ok and getattr(exc, "winerror", None) in {2, 3}:
+                return
+            raise
+        if expected_identity is not None and capability.identity != expected_identity:
+            raise DirectoryRaceError("Pinned directory identity does not match")
+        if self._identity_for(capability.handle) != capability.identity:
+            raise DirectoryRaceError("Pinned directory handle identity changed")
+        prefix = key + "/"
+        if any(candidate.startswith(prefix) for candidate in self._directories):
+            raise OSError(145, "Directory is not empty")
+        self._dispose(capability.handle)
+        del self._directories[key]
+        capability.handle.close()
+
     def unlink(self, relative: str, *, missing_ok: bool = False) -> None:
         self._remove(relative, directory=False, missing_ok=missing_ok)
 
-    def rmdir(self, relative: str, *, missing_ok: bool = False) -> None:
-        self._remove(relative, directory=True, missing_ok=missing_ok)
+    def rmdir(
+        self,
+        relative: str,
+        *,
+        missing_ok: bool = False,
+        expected_identity: RootIdentity | None = None,
+    ) -> None:
+        self._remove_directory(
+            relative,
+            missing_ok=missing_ok,
+            expected_identity=expected_identity,
+        )
+
+    def _close_handles(self, handles: list[SafeHandle]) -> None:
+        first_error: BaseException | None = None
+        for handle in reversed(handles):
+            try:
+                handle.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
 
     def close(self) -> None:
-        root = self._root
+        if self._root is None:
+            return
         self._root = None
-        if root is not None:
-            root.close()
+        capabilities = sorted(
+            self._directories.values(),
+            key=lambda item: len(item.relative.split("/")) if item.relative else 0,
+        )
+        self._directories.clear()
+        acquisition = self._acquisition_handles
+        self._acquisition_handles = []
+        first_error: BaseException | None = None
+        try:
+            self._close_handles([item.handle for item in capabilities])
+        except BaseException as error:
+            first_error = error
+        try:
+            self._close_handles(acquisition)
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+        if first_error is not None:
+            raise first_error
 
     def __enter__(self) -> RepositoryFs:
         self._require_open()
@@ -852,6 +1061,8 @@ class RepositoryFs:
 
 __all__ = [
     "ABI_LAYOUT",
+    "DirectoryObservation",
+    "DirectoryRaceError",
     "IS_WINDOWS",
     "RepositoryFs",
     "RepositoryFsError",

@@ -68,6 +68,7 @@ class WindowsFaultMatrixTests(unittest.TestCase):
         state = json.loads(adapter.read_bytes(manager.STATE_FILENAME).decode("utf-8"))
         state["schema"] = manager.LEGACY_STATE_SCHEMA
         state.pop("rootIdentity")
+        state.pop("directoryIdentities")
         adapter.atomic_write(
             manager.STATE_FILENAME,
             (json.dumps(state, indent=2, sort_keys=True) + "\n").encode("utf-8"),
@@ -119,8 +120,18 @@ class WindowsFaultMatrixTests(unittest.TestCase):
                 finally:
                     adapter.close()
                 self.assert_sanitized_failure(raised.exception, output.getvalue())
-                self.assertEqual(before, self.tree(target))
-                self.assertFalse((target / manager.JOURNAL_FILENAME).exists())
+                self.assertEqual(b"outside", sentinel.read_bytes())
+                journal = target / manager.JOURNAL_FILENAME
+                if stage == "hash":
+                    self.assertEqual(before, self.tree(target))
+                    self.assertFalse(journal.exists())
+                else:
+                    self.assertTrue(journal.is_file())
+                    value = json.loads(journal.read_text(encoding="utf-8"))
+                    self.assertEqual("preparingDirectories", value["phase"])
+                    self.assertTrue(
+                        any(not item["prepared"] for item in value["directories"])
+                    )
 
     def test_journal_phase_and_backup_write_faults_have_deterministic_restart(self) -> None:
         for stage in ("initial-journal", "phase-journal", "backup"):
@@ -168,19 +179,37 @@ class WindowsFaultMatrixTests(unittest.TestCase):
                     adapter.close()
                 self.assert_sanitized_failure(raised.exception, output.getvalue())
                 journal = target / manager.JOURNAL_FILENAME
-                self.assertEqual(stage == "backup", journal.exists())
+                self.assertEqual(stage != "initial-journal", journal.exists())
                 if journal.exists():
                     value = json.loads(journal.read_text(encoding="utf-8"))
-                    self.assertEqual("prepared", value["phase"])
-                    restart = self.native(target)
-                    try:
-                        self.assertEqual(
-                            "RECOVERED: interrupted transaction rolled back\n",
-                            self.recover(restart),
+                    if stage == "phase-journal":
+                        self.assertEqual("preparingDirectories", value["phase"])
+                        self.assertTrue(
+                            any(not item["prepared"] for item in value["directories"])
                         )
-                    finally:
-                        restart.close()
-                self.assertEqual(before, self.tree(target))
+                        restart = self.native(target)
+                        try:
+                            with self.assertRaisesRegex(
+                                manager.WorkflowError, "preparation is incomplete"
+                            ):
+                                self.recover(restart)
+                        finally:
+                            restart.close()
+                        self.assertTrue(journal.exists())
+                    else:
+                        self.assertEqual("prepared", value["phase"])
+                        restart = self.native(target)
+                        try:
+                            self.assertEqual(
+                                "RECOVERED: interrupted transaction rolled back\n",
+                                self.recover(restart),
+                            )
+                        finally:
+                            restart.close()
+                if stage != "phase-journal":
+                    self.assertEqual(before, self.tree(target))
+                else:
+                    self.assertEqual(b"outside", (target / "sentinel.txt").read_bytes())
 
     def test_apply_replace_fault_rolls_back_exact_file_prestate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -341,12 +370,21 @@ class WindowsFaultMatrixTests(unittest.TestCase):
                     raise native_failure()
                 original_write(relative, content)
 
-            def failing_rmdir(relative: str, *, missing_ok: bool = False) -> None:
+            def failing_rmdir(
+                relative: str,
+                *,
+                missing_ok: bool = False,
+                expected_identity: object = None,
+            ) -> None:
                 nonlocal cleanup_failed
                 if not cleanup_failed:
                     cleanup_failed = True
                     raise native_failure()
-                original_rmdir(relative, missing_ok=missing_ok)
+                original_rmdir(
+                    relative,
+                    missing_ok=missing_ok,
+                    expected_identity=expected_identity,
+                )
 
             try:
                 with patch.object(

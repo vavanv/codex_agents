@@ -1,0 +1,12 @@
+{
+  "events.unattempted.jsonl": {
+    "releaseDecision": "NOT READY",
+    "requiredErrors": [
+      "MISSING_CASE:synthetic-pass",
+      "NON_PASS:synthetic-pass",
+      "NON_PASS:synthetic-unattempted",
+      "REAL_EVENT_ADAPTER_UNVALIDATED"
+    ],
+    "runtimeValidated": false
+  }
+}
