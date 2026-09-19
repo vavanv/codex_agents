@@ -31,6 +31,7 @@ The invariants are:
 | --- | --- | --- | --- |
 | v0.1 contracts | `0.154.0` | 2026-09-13 | Contracts-only installation; supported baseline |
 | v0.2 agents preview | `0.154.0` | 2026-09-13 | Static TOML and lifecycle validation; live behavior pending |
+| v0.2 agents preview | `0.155.0` | 2026-09-18 | Static TOML validation only (gated); live behavior pending |
 
 Only listed versions are supported. The installer parses `codex --version`, matches an exact supported entry, and validates the source TOML catalog against `compatibility/codex-agents.json` before an opt-in agent installation. An unsupported or unparseable version is a no-write failure. Adding support requires tests for configuration parsing, instruction discovery, sandbox behavior, subagent spawning, and model availability.
 

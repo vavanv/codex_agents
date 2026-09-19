@@ -161,6 +161,10 @@ class WorkflowManagerTests(unittest.TestCase):
             with self.assertRaisesRegex(manager.WorkflowError, "Unsupported Codex CLI"):
                 manager._validate_codex_version()
 
+    def test_supported_version_0_155_0_is_accepted(self) -> None:
+        with patch.object(manager, "_detect_codex_version", return_value="0.155.0"):
+            self.assertEqual("0.155.0", manager._validate_codex_version())
+
     def test_state_path_cannot_escape_target(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory).resolve()

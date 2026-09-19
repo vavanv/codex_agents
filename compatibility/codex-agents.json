@@ -39,6 +39,44 @@
         "read-only",
         "workspace-write"
       ]
+    },
+    "0.155.0": {
+      "agentSchemaVersion": 1,
+      "allowedKeys": [
+        "name",
+        "description",
+        "developer_instructions",
+        "model",
+        "model_reasoning_effort",
+        "sandbox_mode"
+      ],
+      "models": {
+        "gpt-5.6-luna": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "gpt-5.6-sol": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultra"
+        ]
+      },
+      "requiredKeys": [
+        "name",
+        "description",
+        "developer_instructions"
+      ],
+      "runtimeValidated": false,
+      "sandboxModes": [
+        "read-only",
+        "workspace-write"
+      ]
     }
   }
 }

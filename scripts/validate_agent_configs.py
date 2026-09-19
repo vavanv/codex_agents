@@ -75,6 +75,38 @@ def supported_versions(source_root: Path) -> set[str]:
     return set(versions)
 
 
+def configured_models(source_root: Path) -> dict[str, dict[str, str]]:
+    """Read the source agent TOMLs and return role -> {"model", "effort"}.
+
+    Absent or malformed values become empty strings so routing can fail closed
+    rather than silently inventing a configured value.
+    """
+    result: dict[str, dict[str, str]] = {}
+    if tomllib is None:
+        return result
+    directory = source_root / AGENTS_DIRECTORY
+    if not directory.is_dir():
+        return result
+    for path in sorted(directory.glob("*.toml")):
+        try:
+            with path.open("rb") as stream:
+                value = tomllib.load(stream)
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        name = value.get("name")
+        if not isinstance(name, str):
+            continue
+        model = value.get("model")
+        effort = value.get("model_reasoning_effort")
+        result[name] = {
+            "model": model if isinstance(model, str) else "",
+            "effort": effort if isinstance(effort, str) else "",
+        }
+    return result
+
+
 def validate_catalog(source_root: Path, codex_version: str) -> ValidationReport:
     errors: list[str] = []
     warnings: list[str] = []

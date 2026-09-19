@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from codex_event_adapter import parse_event_stream
 from validate_agent_configs import EXPECTED_ROLES, validate_catalog
 from workflow_manager import CUSTOM_AGENT_FILES, _detect_codex_version
 
@@ -162,142 +163,16 @@ def run_discovery(target: Path, timeout: int) -> DiscoveryProcessResult:
         return DiscoveryProcessResult(None, "", "", False, type(error).__name__)
 
 
-def _normalize_session_id(value: Any) -> str | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        parsed = uuid.UUID(value)
-    except (ValueError, AttributeError):
-        return None
-    normalized = str(parsed)
-    if (
-        value.lower() != normalized
-        or parsed.variant != uuid.RFC_4122
-        or parsed.version not in {4, 7}
-    ):
-        return None
-    return normalized
-
-
-def _record_attribution(
-    attributed: dict[str, str],
-    role: Any,
-    child_id: Any,
-    parent_session_id: str | None,
-    reasons: set[str],
-) -> None:
-    if not isinstance(role, str) or not isinstance(child_id, str):
-        reasons.add("UNSUPPORTED_EVENT_SCHEMA")
-        return
-    if role not in EXPECTED_ROLES:
-        reasons.add("ATTRIBUTION_UNEXPECTED")
-        return
-    if parent_session_id is None:
-        reasons.add("ATTRIBUTION_BEFORE_PARENT")
-    normalized_child_id = _normalize_session_id(child_id)
-    if normalized_child_id is None:
-        reasons.add("INVALID_CHILD_SESSION")
-        return
-    if normalized_child_id == parent_session_id:
-        reasons.add("INVALID_CHILD_SESSION")
-        return
-    existing = attributed.get(role)
-    if existing == normalized_child_id:
-        reasons.add("DUPLICATE_ATTRIBUTION")
-        return
-    if (existing is not None and existing != normalized_child_id) or normalized_child_id in {
-        value for key, value in attributed.items() if key != role
-    }:
-        reasons.add("ATTRIBUTION_CONFLICT")
-        return
-    attributed[role] = normalized_child_id
-
-
 def parse_discovery(stdout: str) -> ParsedDiscovery:
-    reasons: set[str] = set()
-    attributed: dict[str, str] = {}
-    smoke_names: set[str] = set()
-    parent_session_id: str | None = None
-    event_count = 0
-    if stdout and not stdout.endswith("\n"):
-        reasons.add("TRUNCATED_EVENT_STREAM")
-    for raw_line in stdout.splitlines():
-        if not raw_line.strip():
-            continue
-        try:
-            event = json.loads(raw_line)
-        except json.JSONDecodeError:
-            reasons.add("MALFORMED_EVENT_STREAM")
-            continue
-        event_count += 1
-        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
-            reasons.add("UNSUPPORTED_EVENT_SCHEMA")
-            continue
-        event_type = event["type"]
-        if event_type == "thread.started":
-            thread_id = event.get("thread_id")
-            normalized_thread_id = _normalize_session_id(thread_id)
-            if normalized_thread_id is None:
-                reasons.add("UNSUPPORTED_EVENT_SCHEMA")
-            elif parent_session_id is not None and parent_session_id != normalized_thread_id:
-                reasons.add("UNSUPPORTED_EVENT_SCHEMA")
-            else:
-                parent_session_id = normalized_thread_id
-        elif event_type == "agent.spawned":
-            _record_attribution(
-                attributed,
-                event.get("agent_name"),
-                event.get("child_session_id"),
-                parent_session_id,
-                reasons,
-            )
-        elif event_type in {"item.started", "item.completed"}:
-            item = event.get("item")
-            if not isinstance(item, dict) or not isinstance(item.get("type"), str):
-                reasons.add("UNSUPPORTED_EVENT_SCHEMA")
-                continue
-            item_type = item["type"]
-            if item_type == "collaboration_tool_call" and item.get("tool") == "spawn_agent":
-                _record_attribution(
-                    attributed,
-                    item.get("agent_name"),
-                    item.get("child_session_id"),
-                    parent_session_id,
-                    reasons,
-                )
-            elif item_type == "agent_message":
-                text = item.get("text")
-                if isinstance(text, str):
-                    smoke_names.update(line for line in text.splitlines() if line in EXPECTED_ROLES)
-                else:
-                    reasons.add("UNSUPPORTED_EVENT_SCHEMA")
-            elif item_type not in {"reasoning", "command_execution"}:
-                reasons.add("UNSUPPORTED_EVENT_SCHEMA")
-        elif event_type == "error":
-            reasons.add("DISCOVERY_ERROR_EVENT")
-        elif event_type not in {"turn.started", "turn.completed"}:
-            reasons.add("UNSUPPORTED_EVENT_SCHEMA")
-    if parent_session_id is not None:
-        parent_roles = [
-            role for role, child_id in attributed.items() if child_id == parent_session_id
-        ]
-        for role in parent_roles:
-            del attributed[role]
-        if parent_roles:
-            reasons.add("INVALID_CHILD_SESSION")
-    if parent_session_id is None:
-        reasons.add("MISSING_PARENT_SESSION")
-    if set(attributed) != set(EXPECTED_ROLES):
-        reasons.add("MISSING_ATTRIBUTION")
-    integrity = "complete" if not reasons else "untrusted"
+    attribution = parse_event_stream(stdout)
     return ParsedDiscovery(
         adapter=DISCOVERY_ADAPTER,
-        stream_integrity=integrity,
-        parent_session_id=parent_session_id,
-        attributed_children=dict(sorted(attributed.items())),
-        smoke_names=sorted(smoke_names),
-        event_count=event_count,
-        reason_codes=sorted(reasons),
+        stream_integrity=attribution.integrity,
+        parent_session_id=attribution.parent_session_id,
+        attributed_children=dict(attribution.attributed_children),
+        smoke_names=list(attribution.smoke_names),
+        event_count=attribution.event_count,
+        reason_codes=list(attribution.reason_codes),
     )
 
 
