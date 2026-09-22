@@ -1,4 +1,4 @@
-name = "sol-architect-deep"
+name = "sol_architect_deep"
 description = "Read-only deep architect for consequential unresolved security, migration, concurrency, compatibility, or cross-system decisions."
 model = "gpt-5.6-sol"
 model_reasoning_effort = "high"

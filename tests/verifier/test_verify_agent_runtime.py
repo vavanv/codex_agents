@@ -60,7 +60,7 @@ class VerifyAgentRuntimeTests(unittest.TestCase):
         process_result: verifier.DiscoveryProcessResult | None = None,
         run_codex: bool = True,
         install_errors: list[str] | None = None,
-        detect_side_effect: object = "0.154.0",
+        detect_side_effect: object = "0.155.1",
         evidence_path: Path | None = None,
     ) -> tuple[int, str, dict[str, object] | None]:
         arguments = ["verify_agent_runtime.py", "--target", "."]
@@ -126,7 +126,7 @@ class VerifyAgentRuntimeTests(unittest.TestCase):
     def test_unsupported_runtime_version_fails_consistently(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             exit_code, output, evidence = self.invoke(
-                detect_side_effect="0.155.0",
+                detect_side_effect="0.154.0",
                 evidence_path=Path(directory) / "evidence.json",
             )
 
@@ -190,7 +190,7 @@ class VerifyAgentRuntimeTests(unittest.TestCase):
                 3,
             ),
             (
-                self.complete_stream().replace('"agent_name": "code-explorer"', '"agent_name": "code"'),
+                self.complete_stream().replace('"agent_name": "code_explorer"', '"agent_name": "code"'),
                 "UNVERIFIED",
                 3,
             ),
@@ -356,7 +356,7 @@ class VerifyAgentRuntimeTests(unittest.TestCase):
         stderr = StringIO()
         arguments = ["verify_agent_runtime.py", "--target", ".", "--evidence", "ignored.json"]
         with patch.object(sys, "argv", arguments):
-            with patch.object(verifier, "_detect_codex_version", return_value="0.154.0"):
+            with patch.object(verifier, "_detect_codex_version", return_value="0.155.1"):
                 with patch.object(verifier, "verify_installed", return_value=[]):
                     with patch.object(verifier, "_write_evidence", side_effect=OSError("secret path")):
                         with redirect_stdout(stdout), redirect_stderr(stderr):

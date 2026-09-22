@@ -2,7 +2,7 @@
 """Deterministic V3 orchestration: feed event streams and snapshots through the
 versioned event adapter and the role-compliance engine.
 
-This module is the entry point that will consume real captured Codex 0.154.0
+This module is the entry point that will consume real captured Codex 0.155.1
 fixtures and real before/after snapshots to produce per-role compliance
 evidence. It is deterministic and fully testable with synthetic inputs; it does
 not invoke Codex and establishes no live runtime validation.

@@ -56,6 +56,44 @@ class SanitizeTests(unittest.TestCase):
             self.assertTrue(adapter._contains_secret(secret))
         self.assertFalse(adapter._contains_secret("ordinary text"))
 
+    def test_redacts_nested_json_secret_fields(self) -> None:
+        raw = json.dumps(
+            {
+                "type": "event",
+                "token": "ghp_example",
+                "nested": {"clientSecret": "nested-value"},
+                "usage": {"input_tokens": 12},
+            }
+        ) + "\n"
+
+        sanitized = adapter.sanitize_event_stream(raw)
+        event = json.loads(sanitized)
+
+        self.assertEqual("[REDACTED]", event["token"])
+        self.assertEqual("[REDACTED]", event["nested"]["clientSecret"])
+        self.assertEqual(12, event["usage"]["input_tokens"])
+        self.assertNotIn("ghp_example", sanitized)
+        self.assertFalse(adapter._contains_secret(sanitized))
+
+    def test_malformed_json_with_sensitive_field_is_replaced(self) -> None:
+        raw = '{"type":"event","password":"must-not-survive"\n'
+
+        sanitized = adapter.sanitize_event_stream(raw)
+
+        self.assertNotIn("must-not-survive", sanitized)
+        self.assertEqual("sanitization.error", json.loads(sanitized)["type"])
+
+    def test_sanitize_text_redacts_json_diagnostic_fields(self) -> None:
+        raw = json.dumps(
+            {"clientSecret": "top secret phrase", "nested": {"token": "ghp_value"}}
+        )
+
+        sanitized = adapter.sanitize_text(raw, None)
+
+        self.assertNotIn("top secret phrase", sanitized)
+        self.assertNotIn("ghp_value", sanitized)
+        self.assertEqual("[REDACTED]", json.loads(sanitized)["clientSecret"])
+
 
 class ParseTests(unittest.TestCase):
     def test_complete_stream_is_attributed_without_reason_codes(self) -> None:
@@ -105,7 +143,7 @@ class ParseTests(unittest.TestCase):
 
 class FixtureTests(unittest.TestCase):
     @staticmethod
-    def manifest(raw: str, codex_version: str = "0.154.0") -> dict:
+    def manifest(raw: str, codex_version: str = "0.155.1") -> dict:
         return adapter.capture_fixture_manifest("fixture-1", codex_version, raw)
 
     def test_conformant_fixture_validates(self) -> None:
@@ -125,7 +163,7 @@ class FixtureTests(unittest.TestCase):
         )
         self.assertIn("FIXTURE_HASH_MISMATCH", tampered.reason_codes)
 
-        wrong_version = self.manifest(raw, codex_version="0.155.0")
+        wrong_version = self.manifest(raw, codex_version="0.154.0")
         versioned = adapter.validate_captured_fixture(
             adapter.sanitize_event_stream(raw), wrong_version
         )
@@ -150,7 +188,7 @@ class FixtureTests(unittest.TestCase):
         raw = complete_stream()
         manifest = self.manifest(raw)
         result = adapter.validate_captured_fixture(
-            adapter.sanitize_event_stream(raw), manifest, expected_roles=("code-explorer",)
+            adapter.sanitize_event_stream(raw), manifest, expected_roles=("code_explorer",)
         )
         self.assertIn("MISSING_ATTRIBUTION", result.reason_codes)
 

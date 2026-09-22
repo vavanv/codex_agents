@@ -1,4 +1,4 @@
-name = "code-validator"
+name = "code_validator"
 description = "Independent read-only validator that runs approved checks and reports observed PASS, FAIL, or BLOCKED evidence."
 model = "gpt-5.6-luna"
 model_reasoning_effort = "low"

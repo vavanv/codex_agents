@@ -17,13 +17,13 @@ If this file conflicts with the detailed guide, follow `WORK_FLOW.md` for instal
 
 - Installation is contracts-only by default.
 - `--with-custom-agents` (PowerShell: `-WithCustomAgents`) additionally installs the nine TOML definitions under the target project's `.codex/agents/`.
-- Codex CLI `0.154.0` is the statically supported compatibility-registry version; `runtimeValidated` remains `false`. Python 3.11+ is required for custom-agent validation and installation.
-- As of 2026-09-14, deterministic V0a/V1 checks passed (36 lifecycle/recovery, 58 focused, and 64 full-suite tests) and independent review returned `APPROVE`. V0b is blocked on the Windows TOCTOU limitation; V2–V5 are not started, so overall live validation is `NOT READY`.
+- Codex CLI `0.155.1` is the statically supported compatibility-registry version; `runtimeValidated` remains `false`. Python 3.11+ is required for custom-agent validation and installation.
+- As of 2026-09-22, the underscore runtime-role compatibility migration passes static catalog validation, 50 focused installer lifecycle/recovery tests, and all 229 repository tests. Live V3 has started, but its captures have not produced accepted child-role attribution; independent review and the remaining live matrix are still pending, so overall live validation is `NOT READY`.
 - Legacy `hybrid` names in state, markers, and compatibility identifiers are retained for existing installations; they are not the product branding.
 
 ## Prerequisites
 
-- Codex CLI `0.154.0` (`codex --version`)
+- Codex CLI `0.155.1` (`codex --version`)
 - Python 3 (3.11+ for custom agents)
 - PowerShell 7 on Windows or a POSIX shell on Linux/macOS
 - Write access to the target project
@@ -62,7 +62,7 @@ The target defaults to the current directory when omitted. For manual installati
 Run the package checks from this repository:
 
 ```powershell
-python .\scripts\validate_agent_configs.py --codex-version 0.154.0
+python .\scripts\validate_agent_configs.py --codex-version 0.155.1
 python .\scripts\verify_agent_runtime.py --target "C:\path\to\your-project"
 ```
 

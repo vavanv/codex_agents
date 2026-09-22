@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,17 +19,29 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only on Python older
 
 REGISTRY_PATH = Path("compatibility/codex-agents.json")
 AGENTS_DIRECTORY = Path("agents")
-EXPECTED_ROLES = {
-    "code-explorer": "read-only",
-    "quick-implementer": "workspace-write",
-    "implementer": "workspace-write",
-    "luna-escalation": "workspace-write",
-    "sol-architect": "read-only",
-    "sol-architect-deep": "read-only",
-    "code-validator": "read-only",
-    "code-reviewer": "read-only",
-    "commit-pusher": "workspace-write",
+AGENT_FILE_ROLES = {
+    "code-explorer": "code_explorer",
+    "quick-implementer": "quick_implementer",
+    "implementer": "implementer",
+    "luna-escalation": "luna_escalation",
+    "sol-architect": "sol_architect",
+    "sol-architect-deep": "sol_architect_deep",
+    "code-validator": "code_validator",
+    "code-reviewer": "code_reviewer",
+    "commit-pusher": "commit_pusher",
 }
+EXPECTED_ROLES = {
+    "code_explorer": "read-only",
+    "quick_implementer": "workspace-write",
+    "implementer": "workspace-write",
+    "luna_escalation": "workspace-write",
+    "sol_architect": "read-only",
+    "sol_architect_deep": "read-only",
+    "code_validator": "read-only",
+    "code_reviewer": "read-only",
+    "commit_pusher": "workspace-write",
+}
+RUNTIME_ROLE_PATTERN = re.compile(r"[a-z0-9_]+")
 CONTRACT_PHRASES = (
     "Do not delegate",
     "Do not widen scope",
@@ -158,8 +171,8 @@ def validate_catalog(source_root: Path, codex_version: str) -> ValidationReport:
     agents_directory = source_root / AGENTS_DIRECTORY
     files = sorted(agents_directory.glob("*.toml")) if agents_directory.is_dir() else []
     stems = {path.stem for path in files}
-    missing = sorted(set(EXPECTED_ROLES) - stems)
-    extra = sorted(stems - set(EXPECTED_ROLES))
+    missing = sorted(set(AGENT_FILE_ROLES) - stems)
+    extra = sorted(stems - set(AGENT_FILE_ROLES))
     if missing:
         errors.append(f"missing agent files: {', '.join(missing)}")
     if extra:
@@ -185,8 +198,13 @@ def validate_catalog(source_root: Path, codex_version: str) -> ValidationReport:
         if not isinstance(name, str):
             continue
         parsed_names.append(name)
-        if name != path.stem:
-            errors.append(f"{path.name}: name must match filename stem")
+        expected_name = AGENT_FILE_ROLES.get(path.stem)
+        if expected_name is not None and name != expected_name:
+            errors.append(f"{path.name}: name must be {expected_name!r}")
+        if RUNTIME_ROLE_PATTERN.fullmatch(name) is None:
+            errors.append(
+                f"{path.name}: name must use only lowercase letters, digits, and underscores"
+            )
         if name in seen_names:
             errors.append(f"{path.name}: duplicate agent name: {name}")
         seen_names.add(name)

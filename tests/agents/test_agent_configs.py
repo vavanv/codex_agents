@@ -24,19 +24,13 @@ class AgentConfigTests(unittest.TestCase):
         )
 
     def test_repository_catalog_is_valid(self) -> None:
-        report = validator.validate_catalog(REPOSITORY_ROOT, "0.154.0")
+        report = validator.validate_catalog(REPOSITORY_ROOT, "0.155.1")
 
         self.assertTrue(report.passed, report.errors)
         self.assertEqual(set(validator.EXPECTED_ROLES), set(report.agents))
 
-    def test_repository_catalog_is_valid_for_0_155_0(self) -> None:
-        report = validator.validate_catalog(REPOSITORY_ROOT, "0.155.0")
-
-        self.assertTrue(report.passed, report.errors)
-        self.assertEqual(set(validator.EXPECTED_ROLES), set(report.agents))
-
-    def test_supported_versions_lists_both(self) -> None:
-        self.assertEqual({"0.154.0", "0.155.0"}, validator.supported_versions(REPOSITORY_ROOT))
+    def test_supported_versions_lists_single(self) -> None:
+        self.assertEqual({"0.155.1"}, validator.supported_versions(REPOSITORY_ROOT))
 
     def test_unknown_codex_version_fails(self) -> None:
         report = validator.validate_catalog(REPOSITORY_ROOT, "999.0.0")
@@ -50,7 +44,7 @@ class AgentConfigTests(unittest.TestCase):
             self.copy_catalog(target)
             (target / "agents" / "code-explorer.toml").unlink()
 
-            report = validator.validate_catalog(target, "0.154.0")
+            report = validator.validate_catalog(target, "0.155.1")
 
             self.assertFalse(report.passed)
             self.assertTrue(any("missing agent files" in error for error in report.errors))
@@ -64,10 +58,33 @@ class AgentConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            report = validator.validate_catalog(target, "0.154.0")
+            report = validator.validate_catalog(target, "0.155.1")
 
             self.assertFalse(report.passed)
             self.assertTrue(any("invalid TOML" in error for error in report.errors))
+
+    def test_hyphenated_runtime_name_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            self.copy_catalog(target)
+            agent_path = target / "agents" / "code-explorer.toml"
+            agent_path.write_text(
+                agent_path.read_text(encoding="utf-8").replace(
+                    'name = "code_explorer"',
+                    'name = "code-explorer"',
+                ),
+                encoding="utf-8",
+            )
+
+            report = validator.validate_catalog(target, "0.155.1")
+
+            self.assertFalse(report.passed)
+            self.assertTrue(
+                any(
+                    "lowercase letters, digits, and underscores" in error
+                    for error in report.errors
+                )
+            )
 
     def test_unsafe_read_only_role_sandbox_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -82,7 +99,7 @@ class AgentConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            report = validator.validate_catalog(target, "0.154.0")
+            report = validator.validate_catalog(target, "0.155.1")
 
             self.assertFalse(report.passed)
             self.assertTrue(any("sandbox_mode must be" in error for error in report.errors))
@@ -96,7 +113,7 @@ class AgentConfigTests(unittest.TestCase):
             registry["versions"] = []
             registry_path.write_text(json.dumps(registry), encoding="utf-8")
 
-            report = validator.validate_catalog(target, "0.154.0")
+            report = validator.validate_catalog(target, "0.155.1")
 
             self.assertFalse(report.passed)
             self.assertTrue(any("versions must be an object" in error for error in report.errors))

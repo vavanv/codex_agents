@@ -19,22 +19,22 @@ It provides:
 - an opt-in catalog of nine project-level custom agents;
 - offline TOML/schema validation and optional live discovery diagnostics.
 
-Contracts-only installation remains the default. Pass `-WithCustomAgents` on Windows or `--with-custom-agents` on Linux/macOS to validate and install `.codex/agents/*.toml` for the explorer, implementers, architects, escalation agent, validator, reviewer, and commit-pusher roles.
+Contracts-only installation remains the default. Pass `-WithCustomAgents` on Windows or `--with-custom-agents` on Linux/macOS to validate and install `.codex/agents/*.toml` for the explorer, implementers, architects, escalation agent, validator, reviewer, and `commit_pusher` roles.
 
-Custom agents remain opt-in because Codex CLI `0.154.0` is the statically supported compatibility-registry version and `runtimeValidated` remains `false`. Role isolation is also a layered guardrail, not an immutable security boundary: parent-session settings can override agent defaults, and filesystem read-only mode alone cannot prevent every external side effect.
+Custom agents remain opt-in because Codex CLI `0.155.1` is the statically supported compatibility-registry version and `runtimeValidated` remains `false`. Role isolation is also a layered guardrail, not an immutable security boundary: parent-session settings can override agent defaults, and filesystem read-only mode alone cannot prevent every external side effect.
 
 With custom agents installed:
 
 - Codex loads the project TOMLs in new sessions and can select the named roles with their configured models, reasoning efforts, sandboxes, and instructions;
 - explorer, architect, validator, and reviewer TOMLs default to `read-only`;
-- implementers, escalation, and commit-pusher default to `workspace-write` but remain restricted by ownership and authorization instructions;
+- implementers, escalation, and `commit_pusher` default to `workspace-write` but remain restricted by ownership and authorization instructions;
 - the root still owns routing, execution state, integration, and final evidence;
 - static checks prove file/schema consistency, while the optional live diagnostic only collects candidate discovery evidence and cannot currently certify runtime discovery;
 - behavioral permission claims remain unproven until the full disposable-project matrix is run and reviewed.
 
 Installation, update, recovery, and uninstall remain project-scoped. No global Codex agent configuration is added or replaced, and a conflicting unmanaged project agent causes a fail-closed result before writes.
 
-Deterministic status as of **2026-09-14**: V0a is complete and V1's fail-closed deterministic behavior is complete; 36 lifecycle/recovery tests, 58 focused tests, and 64 full-suite tests passed, and independent review returned `APPROVE`. V0b is blocked by the Windows ancestor-swap TOCTOU limitation. Live V1 behavior remains unverified, V2–V5 are not started, and overall live validation is **NOT READY**. See the [current implementation and release status](plan/plan_validated_implementation.md).
+Deterministic status as of **2026-09-22**: the underscore runtime-role compatibility migration passes static catalog validation, 50 focused installer lifecycle/recovery tests, and all 229 repository tests. Live V3 has started, but the retained captures do not yet provide accepted child-role attribution. Independent review and the remaining live matrix are pending, `runtimeValidated` remains `false`, and overall live validation is **NOT READY**. See the [completion roadmap and live checkpoints](plan/plan_validated_finis.md).
 
 ## Installation scope
 
@@ -64,7 +64,7 @@ Before installation, confirm:
 2. The target project directory already exists.
 3. Python 3 is available; Python 3.11 or newer is required when installing custom agents.
 4. Codex CLI is available on `PATH`.
-5. Codex CLI reports version `0.154.0`, the currently statically supported compatibility-registry version.
+5. Codex CLI reports version `0.155.1`, the currently statically supported compatibility-registry version.
 6. You have permission to write to the target project.
 
 Windows PowerShell checks:
@@ -88,7 +88,7 @@ test -d "/path/to/your-project"
 Expected Codex output:
 
 ```text
-codex-cli 0.154.0
+codex-cli 0.155.1
 ```
 
 The installer fails before changing project files if the Codex version is unsupported or cannot be determined.
@@ -429,7 +429,7 @@ if ($MissingFiles.Count -eq 0) {
 If custom agents were requested, also validate the package and installed catalog from the workflow package repository:
 
 ```powershell
-python .\scripts\validate_agent_configs.py --codex-version 0.154.0
+python .\scripts\validate_agent_configs.py --codex-version 0.155.1
 python .\scripts\verify_agent_runtime.py --target "C:\path\to\your-project"
 ```
 
@@ -441,7 +441,7 @@ For an optional live diagnostic in a disposable or non-critical project:
 python .\scripts\verify_agent_runtime.py --target "C:\path\to\your-project" --run-codex --evidence ".\agent-discovery.json"
 ```
 
-`--run-codex` is currently a diagnostic probe, not a runtime certification. Even when Codex launches successfully and emits parseable candidates, the event adapter for `0.154.0` has not been validated against captured lifecycle evidence, so both the overall result and discovery remain `UNVERIFIED`, the command exits 3, and it cannot establish runtime PASS.
+`--run-codex` is currently a diagnostic probe, not a runtime certification. Even when Codex launches successfully and emits parseable candidates, the event adapter for `0.155.1` has not been validated against captured lifecycle evidence, so both the overall result and discovery remain `UNVERIFIED`, the command exits 3, and it cannot establish runtime PASS.
 
 ### Verify instruction discovery
 
@@ -633,7 +633,7 @@ Codex discovers project instructions from the project root toward the current di
 2. Run `scripts/verify_agent_runtime.py` without `--run-codex` to verify installed content.
 3. Confirm the project is trusted; untrusted projects may skip project-scoped `.codex/` configuration.
 4. Start a new session from the target project root.
-5. Run the optional `--run-codex` diagnostic and inspect its sanitized evidence output. Expect `UNVERIFIED`/exit 3 while the `0.154.0` event adapter remains unvalidated; this is not runtime PASS.
+5. Run the optional `--run-codex` diagnostic and inspect its sanitized evidence output. Expect `UNVERIFIED`/exit 3 while the `0.155.1` event adapter remains unvalidated; this is not runtime PASS.
 
 ## Recommended project adoption sequence
 

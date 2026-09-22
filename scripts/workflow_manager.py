@@ -32,7 +32,7 @@ OLDER_JOURNAL_SCHEMAS = {
 }
 ROOT_IDENTITY_SCHEMA = "hybrid-codex-repository-root/v1"
 PACKAGE_VERSION = "0.2.0-agents-preview"
-SUPPORTED_CODEX_VERSIONS = {"0.154.0", "0.155.0"}
+SUPPORTED_CODEX_VERSIONS = {"0.155.1"}
 INSTALL_DIRECTORY = ".codex-workflow"
 STATE_FILENAME = ".hybrid-codex-workflow-state.json"
 JOURNAL_FILENAME = ".hybrid-codex-workflow-transaction.json"

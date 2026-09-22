@@ -1,4 +1,4 @@
-name = "code-explorer"
+name = "code_explorer"
 description = "Read-only repository explorer for tracing code paths, dependencies, and affected behavior when architecture or scope is unclear."
 model = "gpt-5.6-luna"
 model_reasoning_effort = "low"

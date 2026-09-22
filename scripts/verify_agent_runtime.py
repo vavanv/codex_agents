@@ -23,10 +23,10 @@ from workflow_manager import CUSTOM_AGENT_FILES, _detect_codex_version
 
 EVIDENCE_SCHEMA = "codex-agent-verification/v1"
 # This parser is intentionally not represented as validated against a captured
-# 0.154.0 stream. Synthetic regression fixtures establish fail-closed behavior,
+# 0.155.1 stream. Synthetic regression fixtures establish fail-closed behavior,
 # not compatibility with a live Codex event schema.
 DISCOVERY_ADAPTER = "codex-cli-jsonl-unvalidated/v1"
-SUPPORTED_RUNTIME_VERSION = "0.154.0"
+SUPPORTED_RUNTIME_VERSION = "0.155.1"
 REASON_CODES = {
     "ATTRIBUTION_CONFLICT",
     "ATTRIBUTION_BEFORE_PARENT",

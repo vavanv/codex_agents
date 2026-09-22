@@ -9,7 +9,7 @@ attributed before any runtime PASS is considered.
 
 The adapter does **not** establish runtime validation. It understands a
 versioned schema and can attribute a stream deterministically, but until a
-captured, sanitized Codex ``0.154.0`` fixture is reviewed and registered,
+captured, sanitized Codex ``0.155.1`` fixture is reviewed and registered,
 ``runtimeValidated`` stays ``false`` and a parsed stream is only ever UNVERIFIED.
 """
 
@@ -104,6 +104,26 @@ _SECRET_PATTERNS = (
     ),
     re.compile(r"(?i)(?:[a-z][a-z0-9+.-]*://)[^/@\s:]+:[^/@\s]+@"),
 )
+_SENSITIVE_JSON_KEY_SUFFIXES = (
+    "api_key",
+    "access_token",
+    "auth_token",
+    "authorization",
+    "client_secret",
+    "connection_string",
+    "credential",
+    "credentials",
+    "password",
+    "private_key",
+    "secret",
+    "secret_access_key",
+    "token",
+)
+_SENSITIVE_JSON_FIELD = re.compile(
+    r"(?i)[\"']?(?:api[_ -]?key|access[_ -]?token|auth[_ -]?token|authorization|"
+    r"client[_ -]?secret|connection[_ -]?string|credentials?|password|"
+    r"private[_ -]?key|secret(?:[_ -]?access[_ -]?key)?|token)[\"']?\s*:"
+)
 
 
 @dataclass(frozen=True)
@@ -146,15 +166,83 @@ def _redact(value: str) -> str:
     return sanitized
 
 
+def _is_sensitive_json_key(key: str) -> bool:
+    snake_case = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key)
+    normalized = re.sub(r"[^a-z0-9]+", "_", snake_case.lower()).strip("_")
+    return any(
+        normalized == suffix or normalized.endswith(f"_{suffix}")
+        for suffix in _SENSITIVE_JSON_KEY_SUFFIXES
+    )
+
+
+def _redact_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]" if _is_sensitive_json_key(key) else _redact_json(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_json(item) for item in value]
+    if isinstance(value, str):
+        return _redact(value)
+    return value
+
+
+def _json_contains_secret(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if _is_sensitive_json_key(key) and item != "[REDACTED]":
+                return True
+            if _json_contains_secret(item):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_json_contains_secret(item) for item in value)
+    if isinstance(value, str):
+        return any(pattern.search(value) for pattern in _SECRET_PATTERNS)
+    return False
+
+
 def sanitize_text(value: str, limit: int | None = 1000) -> str:
-    sanitized = _redact(value)
+    sanitized_lines: list[str] = []
+    for line in value.splitlines() or [value]:
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            if _SENSITIVE_JSON_FIELD.search(line):
+                sanitized_lines.append("[REDACTED_UNSAFE_DIAGNOSTIC]")
+            else:
+                sanitized_lines.append(_redact(line))
+        else:
+            sanitized_lines.append(
+                json.dumps(
+                    _redact_json(parsed),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+    sanitized = "\n".join(sanitized_lines)
     if limit is None:
         return sanitized
     return sanitized[-limit:]
 
 
 def _contains_secret(value: str) -> bool:
-    return any(pattern.search(value) for pattern in _SECRET_PATTERNS)
+    lines = [line for line in value.splitlines() if line.strip()]
+    if not lines:
+        lines = [value]
+    for line in lines:
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            if _SENSITIVE_JSON_FIELD.search(line):
+                return True
+            if any(pattern.search(line) for pattern in _SECRET_PATTERNS):
+                return True
+        else:
+            if _json_contains_secret(parsed):
+                return True
+    return False
 
 
 def sanitize_event_stream(raw: str) -> str:
@@ -163,7 +251,33 @@ def sanitize_event_stream(raw: str) -> str:
     Returns a canonical sanitized stream: non-blank lines only, each redacted in
     place, terminated by a single trailing newline.
     """
-    lines = [_redact(line) for line in raw.splitlines() if line.strip()]
+    lines: list[str] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            if _SENSITIVE_JSON_FIELD.search(line):
+                lines.append(
+                    json.dumps(
+                        {
+                            "type": "sanitization.error",
+                            "reason": "unsafe_malformed_event",
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+            else:
+                lines.append(_redact(line))
+        else:
+            lines.append(
+                json.dumps(
+                    _redact_json(parsed),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
     if not lines:
         return ""
     return "\n".join(lines) + "\n"
@@ -420,7 +534,7 @@ def validate_captured_fixture(
     if schema != EVENT_SCHEMA:
         reasons.add("FIXTURE_SCHEMA_UNSUPPORTED")
     version = manifest.get("codexVersion") if isinstance(manifest, dict) else None
-    if version != "0.154.0":
+    if version != "0.155.1":
         reasons.add("FIXTURE_VERSION_MISMATCH")
     capture_hash = manifest.get("captureHash") if isinstance(manifest, dict) else None
     recomputed = _sha256(sanitized_text)

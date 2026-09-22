@@ -99,7 +99,7 @@ class WindowsWrapperTests(unittest.TestCase):
             fake_bin = root / "fake codex bin"
             fake_bin.mkdir()
             (fake_bin / "codex.cmd").write_text(
-                "@echo off\r\necho codex-cli 0.154.0\r\n",
+                "@echo off\r\necho codex-cli 0.155.1\r\n",
                 encoding="utf-8",
             )
             target = root / "isolated repository with spaces"

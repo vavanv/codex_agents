@@ -1,4 +1,4 @@
-name = "sol-architect"
+name = "sol_architect"
 description = "Read-only architect for defining implementation boundaries, decisions, risks, validation, and rollback for non-trivial work."
 model = "gpt-5.6-sol"
 model_reasoning_effort = "medium"

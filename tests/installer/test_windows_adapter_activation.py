@@ -46,7 +46,7 @@ class WindowsAdapterActivationTests(unittest.TestCase):
         adapter = self.open_native(target)
         try:
             with patch.object(
-                manager, "_validate_codex_version", return_value="0.154.0"
+                manager, "_validate_codex_version", return_value="0.155.1"
             ):
                 manager.install(target, REPOSITORY_ROOT, False, adapter=adapter)
         finally:
@@ -77,7 +77,7 @@ class WindowsAdapterActivationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory)
             with patch.object(
-                manager, "_validate_codex_version", return_value="0.154.0"
+                manager, "_validate_codex_version", return_value="0.155.1"
             ):
                 manager.install(target, REPOSITORY_ROOT, False)
             state_path = target / manager.STATE_FILENAME
@@ -103,7 +103,7 @@ class WindowsAdapterActivationTests(unittest.TestCase):
             adapter = self.open_native(target)
             try:
                 with patch.object(
-                    manager, "_validate_codex_version", return_value="0.154.0"
+                    manager, "_validate_codex_version", return_value="0.155.1"
                 ):
                     with self.assertRaisesRegex(
                         manager.WorkflowError, "root identity does not match"
@@ -404,7 +404,7 @@ class RecoveryOutputContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory)
             with patch.object(
-                manager, "_validate_codex_version", return_value="0.154.0"
+                manager, "_validate_codex_version", return_value="0.155.1"
             ):
                 manager.install(target, REPOSITORY_ROOT, False)
             adapter = manager.PathRepositoryAdapter(target)

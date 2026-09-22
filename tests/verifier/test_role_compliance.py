@@ -30,13 +30,13 @@ class ChangedPathsTests(unittest.TestCase):
 
 class ReadOnlyRoleTests(unittest.TestCase):
     def test_clean_read_only_role_passes(self) -> None:
-        verdict = rc.evaluate_role("code-explorer", digests(("a.txt",)), digests(("a.txt",)))
+        verdict = rc.evaluate_role("code_explorer", digests(("a.txt",)), digests(("a.txt",)))
         self.assertEqual("PASS", verdict.verdict)
         self.assertEqual((), verdict.reason_codes)
 
     def test_read_only_drift_fails(self) -> None:
         verdict = rc.evaluate_role(
-            "code-explorer",
+            "code_explorer",
             digests(("a.txt",)),
             digests(("a.txt", "sneaky.txt")),
         )
@@ -46,7 +46,7 @@ class ReadOnlyRoleTests(unittest.TestCase):
 
     def test_unattributed_role_is_unverified(self) -> None:
         verdict = rc.evaluate_role(
-            "code-reviewer", digests(()), digests(()), attributed=False
+            "code_reviewer", digests(()), digests(()), attributed=False
         )
         self.assertEqual("UNVERIFIED", verdict.verdict)
         self.assertIn("UNATTRIBUTED_ROLE", verdict.reason_codes)
@@ -93,7 +93,7 @@ class WriteRoleTests(unittest.TestCase):
 
     def test_missing_scope_blocks(self) -> None:
         verdict = rc.evaluate_role(
-            "quick-implementer", digests(()), digests(("new.txt",))
+            "quick_implementer", digests(()), digests(("new.txt",))
         )
         self.assertEqual("BLOCKED", verdict.verdict)
         self.assertIn("MISSING_ALLOWED_SCOPE", verdict.reason_codes)
@@ -101,19 +101,19 @@ class WriteRoleTests(unittest.TestCase):
 
 class PublishRoleTests(unittest.TestCase):
     def test_commit_pusher_requires_authorization(self) -> None:
-        verdict = rc.evaluate_role("commit-pusher", digests(()), digests(()))
+        verdict = rc.evaluate_role("commit_pusher", digests(()), digests(()))
         self.assertEqual("BLOCKED", verdict.verdict)
         self.assertIn("COMMIT_NOT_AUTHORIZED", verdict.reason_codes)
 
     def test_authorized_commit_pusher_with_clean_tree_passes(self) -> None:
         verdict = rc.evaluate_role(
-            "commit-pusher", digests(()), digests(()), authorized_commit=True
+            "commit_pusher", digests(()), digests(()), authorized_commit=True
         )
         self.assertEqual("PASS", verdict.verdict)
 
     def test_commit_pusher_file_drift_fails(self) -> None:
         verdict = rc.evaluate_role(
-            "commit-pusher",
+            "commit_pusher",
             digests(()),
             digests(("unexpected.txt",)),
             authorized_commit=True,
@@ -131,12 +131,12 @@ class EvaluateRolesTests(unittest.TestCase):
         }
 
     def test_single_clean_read_only_role_with_unattributed_rest(self) -> None:
-        attribution = {"code-explorer": "00000000-0000-4000-8000-000000000002"}
+        attribution = {"code_explorer": "00000000-0000-4000-8000-000000000002"}
         verdicts = rc.evaluate_roles(
             attribution, digests(("a.txt",)), digests(("a.txt",))
         )
         by_role = {item.role: item for item in verdicts}
-        self.assertEqual("PASS", by_role["code-explorer"].verdict)
+        self.assertEqual("PASS", by_role["code_explorer"].verdict)
         unattributed = [item for item in verdicts if not item.attributed]
         self.assertEqual(8, len(unattributed))
         self.assertTrue(all(item.verdict == "UNVERIFIED" for item in unattributed))
@@ -154,22 +154,22 @@ class EvaluateRolesTests(unittest.TestCase):
         )
         by_role = {item.role: item for item in verdicts}
         self.assertEqual("PASS", by_role["implementer"].verdict)
-        self.assertEqual("UNVERIFIED", by_role["code-explorer"].verdict)
-        self.assertEqual("UNVERIFIED", by_role["quick-implementer"].verdict)
+        self.assertEqual("UNVERIFIED", by_role["code_explorer"].verdict)
+        self.assertEqual("UNVERIFIED", by_role["quick_implementer"].verdict)
 
     def test_attributed_write_role_without_scope_is_blocked(self) -> None:
-        attribution = {"quick-implementer": "00000000-0000-4000-8000-000000000002"}
+        attribution = {"quick_implementer": "00000000-0000-4000-8000-000000000002"}
         verdicts = rc.evaluate_roles(
             attribution, digests(("a.txt",)), digests(("a.txt", "b.txt"))
         )
         by_role = {item.role: item for item in verdicts}
-        self.assertEqual("BLOCKED", by_role["quick-implementer"].verdict)
+        self.assertEqual("BLOCKED", by_role["quick_implementer"].verdict)
 
     def test_summary_reports_counts_and_overall(self) -> None:
         allowed_paths = {
             "implementer": frozenset(),
-            "quick-implementer": frozenset(),
-            "luna-escalation": frozenset(),
+            "quick_implementer": frozenset(),
+            "luna_escalation": frozenset(),
         }
         verdicts = rc.evaluate_roles(
             self.attribution(),

@@ -1,4 +1,4 @@
-name = "code-reviewer"
+name = "code_reviewer"
 description = "Read-only final reviewer for correctness, security, compatibility, regression risk, and missing validation in high-risk changes."
 model = "gpt-5.6-sol"
 model_reasoning_effort = "high"

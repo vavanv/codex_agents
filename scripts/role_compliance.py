@@ -22,7 +22,7 @@ READONLY_MODE = "read-only"
 WRITE_MODE = "workspace-write"
 
 # Roles whose only sanctioned side effect is Git publication.
-PUBLISH_ROLES = frozenset({"commit-pusher"})
+PUBLISH_ROLES = frozenset({"commit_pusher"})
 
 # Verdicts a role can receive.
 VERDICTS = frozenset({"PASS", "FAIL", "BLOCKED", "UNVERIFIED"})

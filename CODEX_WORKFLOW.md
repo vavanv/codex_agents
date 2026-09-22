@@ -1,7 +1,7 @@
 # Codex Workflow Contract
 
-**Contract version:** `1.0.0-draft`  
-**Milestone:** Workflow contracts and project custom-agent preview  
+**Contract version:** `1.0.0-draft`
+**Milestone:** Workflow contracts and project custom-agent preview
 **Status:** Contracts and opt-in TOML installation implemented
 
 ## 1. Purpose and invariants
@@ -29,9 +29,7 @@ The invariants are:
 
 | Workflow release | Codex CLI | Validation date | Status |
 | --- | --- | --- | --- |
-| v0.1 contracts | `0.154.0` | 2026-09-13 | Contracts-only installation; supported baseline |
-| v0.2 agents preview | `0.154.0` | 2026-09-13 | Static TOML and lifecycle validation; live behavior pending |
-| v0.2 agents preview | `0.155.0` | 2026-09-18 | Static TOML validation only (gated); live behavior pending |
+| v0.2 agents preview | `0.155.1` | 2026-09-22 | Contracts and static TOML/lifecycle validation; live behavior pending |
 
 Only listed versions are supported. The installer parses `codex --version`, matches an exact supported entry, and validates the source TOML catalog against `compatibility/codex-agents.json` before an opt-in agent installation. An unsupported or unparseable version is a no-write failure. Adding support requires tests for configuration parsing, instruction discovery, sandbox behavior, subagent spawning, and model availability.
 

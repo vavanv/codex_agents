@@ -66,7 +66,7 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertEqual(set(EXPECTED_ROLES), set(item.role for item in verdicts))
 
     def test_model_mismatch_fails(self) -> None:
-        role = "code-explorer"
+        role = "code_explorer"
         overrides = {role: {"model": "wrong-model"}}
         attribution = adapter.parse_event_stream(build_stream(self.configured, overrides))
         verdicts = routing.evaluate_model_routing(self.configured, attribution)
@@ -96,7 +96,7 @@ class ModelRoutingTests(unittest.TestCase):
         stream = (
             json.dumps({"type": "thread.started", "thread_id": PARENT}) + "\n"
             + json.dumps(
-                spawn("code-explorer", 0, "gpt-5.6-luna", "low")
+                spawn("code_explorer", 0, "gpt-5.6-luna", "low")
             )
             + "\n"
             + json.dumps({"type": "turn.completed"}) + "\n"
@@ -104,7 +104,7 @@ class ModelRoutingTests(unittest.TestCase):
         attribution = adapter.parse_event_stream(stream)
         verdicts = routing.evaluate_model_routing(self.configured, attribution)
         by_role = {item.role: item for item in verdicts}
-        self.assertEqual("PASS", by_role["code-explorer"].verdict)
+        self.assertEqual("PASS", by_role["code_explorer"].verdict)
         self.assertEqual("UNVERIFIED", by_role["implementer"].verdict)
         self.assertIn("UNATTRIBUTED_ROLE", by_role["implementer"].reason_codes)
 

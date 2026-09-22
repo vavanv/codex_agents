@@ -124,7 +124,7 @@ class WindowsNamespaceSwapTests(unittest.TestCase):
         return adapter
 
     def install(self, adapter: manager.RepositoryAdapter) -> None:
-        with patch.object(manager, "_validate_codex_version", return_value="0.154.0"):
+        with patch.object(manager, "_validate_codex_version", return_value="0.155.1"):
             with redirect_stdout(StringIO()):
                 manager.install(
                     adapter.root, REPOSITORY_ROOT, False, adapter=adapter

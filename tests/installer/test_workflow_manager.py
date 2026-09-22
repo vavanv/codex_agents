@@ -24,7 +24,7 @@ class WorkflowManagerTests(unittest.TestCase):
         dry_run: bool = False,
         with_custom_agents: bool = False,
     ) -> None:
-        with patch.object(manager, "_validate_codex_version", return_value="0.154.0"):
+        with patch.object(manager, "_validate_codex_version", return_value="0.155.1"):
             with redirect_stdout(StringIO()):
                 manager.install(target, REPOSITORY_ROOT, dry_run, with_custom_agents)
 
@@ -161,9 +161,9 @@ class WorkflowManagerTests(unittest.TestCase):
             with self.assertRaisesRegex(manager.WorkflowError, "Unsupported Codex CLI"):
                 manager._validate_codex_version()
 
-    def test_supported_version_0_155_0_is_accepted(self) -> None:
-        with patch.object(manager, "_detect_codex_version", return_value="0.155.0"):
-            self.assertEqual("0.155.0", manager._validate_codex_version())
+    def test_supported_version_0_155_1_is_accepted(self) -> None:
+        with patch.object(manager, "_detect_codex_version", return_value="0.155.1"):
+            self.assertEqual("0.155.1", manager._validate_codex_version())
 
     def test_state_path_cannot_escape_target(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -299,7 +299,7 @@ class WorkflowManagerTests(unittest.TestCase):
             source_root = root / "source"
             target.mkdir()
             self.copy_install_sources(source_root)
-            with patch.object(manager, "_validate_codex_version", return_value="0.154.0"):
+            with patch.object(manager, "_validate_codex_version", return_value="0.155.1"):
                 with redirect_stdout(StringIO()):
                     manager.install(target, source_root, False)
                 package_source = source_root / "CODEX_WORKFLOW.md"

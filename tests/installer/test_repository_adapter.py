@@ -237,7 +237,7 @@ class RepositoryAdapterTests(unittest.TestCase):
             adapter = RecordingPathRepositoryAdapter(target)
             with patch.object(manager, "_repository_adapter", return_value=adapter) as factory:
                 with patch.object(
-                    manager, "_validate_codex_version", return_value="0.154.0"
+                    manager, "_validate_codex_version", return_value="0.155.1"
                 ):
                     manager.install(target, REPOSITORY_ROOT, False)
 

@@ -27,7 +27,7 @@ class RecoveryTests(unittest.TestCase):
         return path
 
     def install(self, target: Path, dry_run: bool = False) -> None:
-        with patch.object(manager, "_validate_codex_version", return_value="0.154.0"):
+        with patch.object(manager, "_validate_codex_version", return_value="0.155.1"):
             with redirect_stdout(StringIO()):
                 manager.install(target, REPOSITORY_ROOT, dry_run)
 

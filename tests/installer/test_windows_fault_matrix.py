@@ -35,7 +35,7 @@ class WindowsFaultMatrixTests(unittest.TestCase):
         self, adapter: manager.RepositoryAdapter
     ) -> tuple[str | None, str]:
         output = StringIO()
-        with patch.object(manager, "_validate_codex_version", return_value="0.154.0"):
+        with patch.object(manager, "_validate_codex_version", return_value="0.155.1"):
             with redirect_stdout(output):
                 result = manager.install(
                     adapter.root,
@@ -525,7 +525,7 @@ class WindowsFaultMatrixTests(unittest.TestCase):
                 committed_uninstall = operation == "uninstall" and phase == "committed"
                 if committed_uninstall:
                     with patch.object(
-                        manager, "_validate_codex_version", return_value="0.154.0"
+                        manager, "_validate_codex_version", return_value="0.155.1"
                     ):
                         manager.install(target, REPOSITORY_ROOT, False)
                     relative = manager.STATE_FILENAME

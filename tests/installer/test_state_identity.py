@@ -19,7 +19,7 @@ import workflow_manager as manager
 class StateIdentityTests(unittest.TestCase):
     def install(self, target: Path, dry_run: bool = False) -> str:
         output = StringIO()
-        with patch.object(manager, "_validate_codex_version", return_value="0.154.0"):
+        with patch.object(manager, "_validate_codex_version", return_value="0.155.1"):
             with redirect_stdout(output):
                 manager.install(target, REPOSITORY_ROOT, dry_run)
         return output.getvalue()

@@ -505,7 +505,7 @@ class AggregationAndReportTests(LiveHarnessTestCase):
             manifest,
             run_id=self.run_id,
             platform="windows-native",
-            codex_version="0.154.0",
+            codex_version="0.155.1",
             repository_commit=self.revision,
             configuration_hash=self.configuration_hash,
             run_root=run_root,
