@@ -158,7 +158,7 @@ def _persist_capture(
         }
     )
     sanitized_stream = sanitize_event_stream(stdout)
-    stream = parse_event_stream(sanitized_stream)
+    stream = parse_event_stream(sanitized_stream, expected_roles=roles)
     _write_text(results / "real-capture.sanitized.jsonl", sanitized_stream)
     _write_json(results / "real-capture.manifest.json", manifest)
     return manifest, stream

@@ -51,6 +51,7 @@ SUPPORTED_ITEM_TYPES = frozenset(
         "agent_message",
         "reasoning",
         "command_execution",
+        "collab_tool_call",
         "collaboration_tool_call",
     }
 )
@@ -60,6 +61,22 @@ PASSIVE_ITEM_TYPES = frozenset({"reasoning", "command_execution"})
 
 # Collaboration tools that carry spawn attribution.
 SPAWN_TOOLS = frozenset({"spawn_agent"})
+
+# Codex 0.155.1 emits ``collab_tool_call`` items using this tool vocabulary.
+COLLAB_TOOLS = frozenset({"spawn_agent", "send_input", "wait", "close_agent"})
+COLLAB_STATUSES = frozenset({"in_progress", "completed", "failed"})
+COLLAB_AGENT_STATUSES = frozenset(
+    {
+        "pending",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+        "shutting_down",
+        "shutdown",
+        "not_found",
+    }
+)
 
 # Terminal event types whose presence is required for a coherent attribution.
 TERMINAL_EVENT_TYPES = frozenset({"turn.completed", "thread.completed"})
@@ -80,10 +97,23 @@ REASON_CODES = frozenset(
         "MISSING_PARENT_SESSION",
         "DISCOVERY_ERROR_EVENT",
         "MISSING_TERMINAL_ATTRIBUTION",
+        "INVALID_EXPECTED_ROLES",
+        "MALFORMED_COLLAB_TOOL_CALL",
+        "UNSUPPORTED_COLLAB_TOOL",
+        "COLLAB_TOOL_CALL_FAILED",
+        "COLLAB_PARENT_MISMATCH",
+        "AMBIGUOUS_ATTRIBUTION",
         "FIXTURE_SCHEMA_UNSUPPORTED",
+        "FIXTURE_MANIFEST_SCHEMA_UNSUPPORTED",
         "FIXTURE_VERSION_MISMATCH",
         "FIXTURE_HASH_MISMATCH",
         "FIXTURE_SECRET_PRESENT",
+        "FIXTURE_REVIEW_REQUIRED",
+        "FIXTURE_SANITIZED_REQUIRED",
+        "FIXTURE_REQUESTED_ROLES_INVALID",
+        "FIXTURE_REQUESTED_ROLES_MISMATCH",
+        "FIXTURE_CAPTURE_TIMED_OUT",
+        "FIXTURE_EXIT_CODE_INVALID",
     }
 )
 
@@ -305,12 +335,13 @@ def _record_attribution(
     role: Any,
     child_id: Any,
     parent_session_id: str | None,
+    expected_roles: frozenset[str],
     reasons: set[str],
 ) -> None:
     if not isinstance(role, str) or not isinstance(child_id, str):
         reasons.add("UNSUPPORTED_EVENT_SCHEMA")
         return
-    if role not in EXPECTED_ROLES:
+    if role not in expected_roles:
         reasons.add("ATTRIBUTION_UNEXPECTED")
         return
     if parent_session_id is None:
@@ -340,9 +371,10 @@ def _record_model_effort(
     role: Any,
     model_value: Any,
     effort_value: Any,
+    expected_roles: frozenset[str],
 ) -> None:
     """Record observed model/effort metadata for an attributed role, if present."""
-    if not isinstance(role, str) or role not in EXPECTED_ROLES:
+    if not isinstance(role, str) or role not in expected_roles:
         return
     if isinstance(model_value, str) and model_value and not _contains_secret(model_value):
         observed_models[role] = model_value
@@ -350,7 +382,174 @@ def _record_model_effort(
         observed_efforts[role] = effort_value
 
 
-def parse_event_stream(text: str, schema: str = EVENT_SCHEMA) -> StreamAttribution:
+def _normalize_expected_roles(
+    expected_roles: tuple[str, ...] | None,
+) -> tuple[tuple[str, ...], bool, bool]:
+    """Return normalized roles, validity, and whether roles were explicit."""
+    if expected_roles is None:
+        return tuple(sorted(EXPECTED_ROLES)), True, False
+    if not isinstance(expected_roles, tuple) or not expected_roles:
+        return (), False, True
+    if any(
+        not isinstance(role, str) or role not in EXPECTED_ROLES
+        for role in expected_roles
+    ):
+        return (), False, True
+    if len(set(expected_roles)) != len(expected_roles):
+        return (), False, True
+    return tuple(sorted(expected_roles)), True, True
+
+
+def _collab_agent_state_valid(value: Any) -> bool:
+    if isinstance(value, str):
+        return value in COLLAB_AGENT_STATUSES
+    if isinstance(value, dict) and set(value) == {"status"}:
+        return value.get("status") in COLLAB_AGENT_STATUSES
+    return False
+
+
+def _parse_collab_tool_call(
+    item: dict[str, Any],
+    event_type: str,
+    attributed: dict[str, str],
+    parent_session_id: str | None,
+    expected_roles: tuple[str, ...],
+    expected_roles_valid: bool,
+    expected_roles_explicit: bool,
+    reasons: set[str],
+) -> None:
+    """Validate one Codex 0.155.1 collaboration item and record safe attribution."""
+    item_valid = True
+    required_fields = {
+        "type",
+        "tool",
+        "status",
+        "sender_thread_id",
+        "receiver_thread_ids",
+        "prompt",
+        "agents_states",
+    }
+    if not required_fields.issubset(item):
+        reasons.add("MALFORMED_COLLAB_TOOL_CALL")
+        return
+
+    tool = item.get("tool")
+    if not isinstance(tool, str) or tool not in COLLAB_TOOLS:
+        reasons.add("UNSUPPORTED_COLLAB_TOOL")
+        return
+    status = item.get("status")
+    if not isinstance(status, str) or status not in COLLAB_STATUSES:
+        reasons.add("MALFORMED_COLLAB_TOOL_CALL")
+        return
+    permitted_statuses = {
+        "item.started": {"in_progress"},
+        "item.updated": {"in_progress", "completed", "failed"},
+        "item.completed": {"completed", "failed"},
+    }
+    if status not in permitted_statuses[event_type]:
+        reasons.add("MALFORMED_COLLAB_TOOL_CALL")
+        item_valid = False
+
+    sender = _normalize_session_id(item.get("sender_thread_id"))
+    if sender is None:
+        reasons.add("MALFORMED_COLLAB_TOOL_CALL")
+        item_valid = False
+    elif parent_session_id is None:
+        reasons.add("ATTRIBUTION_BEFORE_PARENT")
+        item_valid = False
+    elif sender != parent_session_id:
+        reasons.add("COLLAB_PARENT_MISMATCH")
+        item_valid = False
+
+    receivers_value = item.get("receiver_thread_ids")
+    receivers: list[str] = []
+    if not isinstance(receivers_value, list):
+        reasons.add("MALFORMED_COLLAB_TOOL_CALL")
+        item_valid = False
+    else:
+        for receiver_value in receivers_value:
+            receiver = _normalize_session_id(receiver_value)
+            if receiver is None or receiver == parent_session_id:
+                reasons.add("INVALID_CHILD_SESSION")
+                item_valid = False
+                continue
+            receivers.append(receiver)
+        if len(set(receivers)) != len(receivers):
+            reasons.add("MALFORMED_COLLAB_TOOL_CALL")
+            item_valid = False
+
+    prompt = item.get("prompt")
+    if prompt is not None and not isinstance(prompt, str):
+        reasons.add("MALFORMED_COLLAB_TOOL_CALL")
+        item_valid = False
+    if tool in {"spawn_agent", "send_input"} and not (
+        isinstance(prompt, str) and prompt
+    ):
+        reasons.add("MALFORMED_COLLAB_TOOL_CALL")
+        item_valid = False
+    if tool in {"wait", "close_agent"} and prompt is not None:
+        reasons.add("MALFORMED_COLLAB_TOOL_CALL")
+        item_valid = False
+
+    agents_states = item.get("agents_states")
+    if not isinstance(agents_states, dict):
+        reasons.add("MALFORMED_COLLAB_TOOL_CALL")
+        item_valid = False
+    else:
+        for agent_id, state in agents_states.items():
+            normalized_agent_id = _normalize_session_id(agent_id)
+            if (
+                normalized_agent_id is None
+                or normalized_agent_id == parent_session_id
+                or not _collab_agent_state_valid(state)
+            ):
+                reasons.add("MALFORMED_COLLAB_TOOL_CALL")
+                item_valid = False
+            state_value = state.get("status") if isinstance(state, dict) else state
+            if state_value in {"failed", "cancelled", "not_found"}:
+                reasons.add("COLLAB_TOOL_CALL_FAILED")
+                item_valid = False
+
+    if tool == "wait" and receivers:
+        reasons.add("MALFORMED_COLLAB_TOOL_CALL")
+        item_valid = False
+    if tool in {"send_input", "close_agent"} and len(receivers) != 1:
+        reasons.add("MALFORMED_COLLAB_TOOL_CALL")
+        item_valid = False
+    if status == "failed":
+        reasons.add("COLLAB_TOOL_CALL_FAILED")
+        item_valid = False
+
+    if tool != "spawn_agent" or status != "completed":
+        return
+    if not item_valid:
+        return
+    if len(receivers) != 1:
+        reasons.add("AMBIGUOUS_ATTRIBUTION")
+        return
+    if not (
+        expected_roles_valid
+        and expected_roles_explicit
+        and len(expected_roles) == 1
+    ):
+        reasons.add("AMBIGUOUS_ATTRIBUTION")
+        return
+    _record_attribution(
+        attributed,
+        expected_roles[0],
+        receivers[0],
+        parent_session_id,
+        frozenset(expected_roles),
+        reasons,
+    )
+
+
+def parse_event_stream(
+    text: str,
+    schema: str = EVENT_SCHEMA,
+    *,
+    expected_roles: tuple[str, ...] | None = None,
+) -> StreamAttribution:
     """Parse one Codex CLI JSONL event stream into a fail-closed attribution.
 
     Mirrors the verifier's discovery parser and adds ``item.updated`` and
@@ -368,7 +567,13 @@ def parse_event_stream(text: str, schema: str = EVENT_SCHEMA) -> StreamAttributi
             observed_models={},
             observed_efforts={},
         )
+    normalized_roles, roles_valid, roles_explicit = _normalize_expected_roles(
+        expected_roles
+    )
+    expected_role_set = frozenset(normalized_roles)
     reasons: set[str] = set()
+    if not roles_valid:
+        reasons.add("INVALID_EXPECTED_ROLES")
     attributed: dict[str, str] = {}
     smoke_names: set[str] = set()
     parent_session_id: str | None = None
@@ -408,6 +613,7 @@ def parse_event_stream(text: str, schema: str = EVENT_SCHEMA) -> StreamAttributi
                 event.get("agent_name"),
                 event.get("child_session_id"),
                 parent_session_id,
+                expected_role_set,
                 reasons,
             )
             _record_model_effort(
@@ -416,6 +622,7 @@ def parse_event_stream(text: str, schema: str = EVENT_SCHEMA) -> StreamAttributi
                 event.get("agent_name"),
                 event.get("model"),
                 event.get("model_reasoning_effort"),
+                expected_role_set,
             )
         elif event_type in {"item.started", "item.completed", "item.updated"}:
             item = event.get("item")
@@ -423,26 +630,60 @@ def parse_event_stream(text: str, schema: str = EVENT_SCHEMA) -> StreamAttributi
                 reasons.add("UNSUPPORTED_EVENT_SCHEMA")
                 continue
             item_type = item["type"]
-            if item_type == "collaboration_tool_call" and item.get("tool") == "spawn_agent":
-                _record_attribution(
+            if item_type == "collab_tool_call":
+                _parse_collab_tool_call(
+                    item,
+                    event_type,
                     attributed,
-                    item.get("agent_name"),
-                    item.get("child_session_id"),
                     parent_session_id,
+                    normalized_roles,
+                    roles_valid,
+                    roles_explicit,
                     reasons,
                 )
-                _record_model_effort(
-                    observed_models,
-                    observed_efforts,
-                    item.get("agent_name"),
-                    item.get("model"),
-                    item.get("model_reasoning_effort"),
-                )
+            elif item_type == "collaboration_tool_call" and item.get("tool") == "spawn_agent":
+                status = item.get("status")
+                status_valid = status is None
+                if status is not None:
+                    permitted_statuses = {
+                        "item.started": {"in_progress"},
+                        "item.updated": {"in_progress", "completed", "failed"},
+                        "item.completed": {"completed", "failed"},
+                    }
+                    status_valid = (
+                        isinstance(status, str)
+                        and status in permitted_statuses[event_type]
+                    )
+                    if not status_valid:
+                        reasons.add("MALFORMED_COLLAB_TOOL_CALL")
+                    if status == "failed":
+                        reasons.add("COLLAB_TOOL_CALL_FAILED")
+                if (
+                    event_type == "item.completed"
+                    and status_valid
+                    and status != "failed"
+                ):
+                    _record_attribution(
+                        attributed,
+                        item.get("agent_name"),
+                        item.get("child_session_id"),
+                        parent_session_id,
+                        expected_role_set,
+                        reasons,
+                    )
+                    _record_model_effort(
+                        observed_models,
+                        observed_efforts,
+                        item.get("agent_name"),
+                        item.get("model"),
+                        item.get("model_reasoning_effort"),
+                        expected_role_set,
+                    )
             elif item_type == "agent_message":
                 text_value = item.get("text")
                 if isinstance(text_value, str):
                     smoke_names.update(
-                        line for line in text_value.splitlines() if line in EXPECTED_ROLES
+                        line for line in text_value.splitlines() if line in expected_role_set
                     )
                 else:
                     reasons.add("UNSUPPORTED_EVENT_SCHEMA")
@@ -462,7 +703,7 @@ def parse_event_stream(text: str, schema: str = EVENT_SCHEMA) -> StreamAttributi
             reasons.add("INVALID_CHILD_SESSION")
     if parent_session_id is None:
         reasons.add("MISSING_PARENT_SESSION")
-    if set(attributed) != set(EXPECTED_ROLES):
+    if not roles_valid or set(attributed) != expected_role_set:
         reasons.add("MISSING_ATTRIBUTION")
     observed_models = {
         role: value for role, value in observed_models.items() if role in attributed
@@ -525,11 +766,16 @@ def validate_captured_fixture(
     coherent terminal/call attribution gate. ``expected_roles`` defaults to the
     full catalog so a partial fixture is a non-conformant result.
     """
-    expected_roles = tuple(sorted(expected_roles or EXPECTED_ROLES))
+    normalized_roles, roles_valid, _ = _normalize_expected_roles(expected_roles)
     reasons: set[str] = set()
+    if not roles_valid:
+        reasons.add("INVALID_EXPECTED_ROLES")
     name = manifest.get("name") if isinstance(manifest, dict) else None
     if not isinstance(name, str) or not name:
         reasons.add("FIXTURE_SCHEMA_UNSUPPORTED")
+    manifest_schema = manifest.get("schema") if isinstance(manifest, dict) else None
+    if manifest_schema != "codex-live-fixture-manifest/v1":
+        reasons.add("FIXTURE_MANIFEST_SCHEMA_UNSUPPORTED")
     schema = manifest.get("eventSchema") if isinstance(manifest, dict) else None
     if schema != EVENT_SCHEMA:
         reasons.add("FIXTURE_SCHEMA_UNSUPPORTED")
@@ -543,12 +789,45 @@ def validate_captured_fixture(
     if _contains_secret(sanitized_text):
         reasons.add("FIXTURE_SECRET_PRESENT")
 
-    attribution = parse_event_stream(sanitized_text, EVENT_SCHEMA)
+    reviewed = manifest.get("reviewed") if isinstance(manifest, dict) else None
+    if reviewed is not True:
+        reasons.add("FIXTURE_REVIEW_REQUIRED")
+    sanitized_flag = manifest.get("sanitized") if isinstance(manifest, dict) else None
+    if sanitized_flag is not True:
+        reasons.add("FIXTURE_SANITIZED_REQUIRED")
+    requested_roles = (
+        manifest.get("requestedRoles") if isinstance(manifest, dict) else None
+    )
+    requested_roles_valid = (
+        isinstance(requested_roles, list)
+        and bool(requested_roles)
+        and all(
+            isinstance(role, str) and role in EXPECTED_ROLES
+            for role in requested_roles
+        )
+        and len(set(requested_roles)) == len(requested_roles)
+    )
+    if not requested_roles_valid:
+        reasons.add("FIXTURE_REQUESTED_ROLES_INVALID")
+    elif set(requested_roles) != set(normalized_roles):
+        reasons.add("FIXTURE_REQUESTED_ROLES_MISMATCH")
+    timed_out = manifest.get("timedOut") if isinstance(manifest, dict) else None
+    if timed_out is not False:
+        reasons.add("FIXTURE_CAPTURE_TIMED_OUT")
+    exit_code = manifest.get("exitCode") if isinstance(manifest, dict) else None
+    if type(exit_code) is not int or exit_code != 0:
+        reasons.add("FIXTURE_EXIT_CODE_INVALID")
+
+    attribution = parse_event_stream(
+        sanitized_text,
+        EVENT_SCHEMA,
+        expected_roles=normalized_roles if roles_valid else (),
+    )
     for code in attribution.reason_codes:
         reasons.add(code)
     if not attribution.terminal_seen:
         reasons.add("MISSING_TERMINAL_ATTRIBUTION")
-    if set(attribution.attributed_children) != set(expected_roles):
+    if not roles_valid or set(attribution.attributed_children) != set(normalized_roles):
         reasons.add("MISSING_ATTRIBUTION")
 
     conformance = "schema-conformant" if not reasons else "not-schema-conformant"

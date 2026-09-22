@@ -13,6 +13,11 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 
 import capture_live_event as capture_module
+import codex_event_adapter as adapter
+
+
+PARENT = "00000000-0000-4000-8000-000000000001"
+CHILD = "00000000-0000-4000-8000-000000000002"
 
 
 class CaptureLiveEventTests(unittest.TestCase):
@@ -72,17 +77,26 @@ class CaptureLiveEventTests(unittest.TestCase):
             self.assertNotIn("cmd.exe", " ".join(prefix).lower())
 
     def test_persistent_capture_uses_underscore_role_and_isolated_sqlite(self) -> None:
-        event_stream = (
-            json.dumps(
-                {
-                    "type": "thread.started",
-                    "thread_id": "00000000-0000-4000-8000-000000000001",
-                }
+        event_stream = "\n".join(
+            (
+                json.dumps({"type": "thread.started", "thread_id": PARENT}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "collab_tool_call",
+                            "tool": "spawn_agent",
+                            "status": "completed",
+                            "sender_thread_id": PARENT,
+                            "receiver_thread_ids": [CHILD],
+                            "prompt": "bounded task",
+                            "agents_states": {},
+                        },
+                    }
+                ),
+                json.dumps({"type": "turn.completed"}),
             )
-            + "\n"
-            + json.dumps({"type": "turn.completed"})
-            + "\n"
-        )
+        ) + "\n"
         with tempfile.TemporaryDirectory() as temporary:
             fixture, results, sqlite_home = self.directories(Path(temporary))
             completed = subprocess.CompletedProcess(
@@ -111,6 +125,8 @@ class CaptureLiveEventTests(unittest.TestCase):
 
             self.assertEqual(0, exit_code)
             self.assertEqual("CAPTURED", output["status"])
+            self.assertEqual(["code_explorer"], output["attributedRoles"])
+            self.assertEqual([], output["reasonCodes"])
             command = run.call_args.args[0]
             self.assertEqual(
                 [r"C:\Tools\node.exe", r"C:\Tools\codex.js"], command[:2]
@@ -171,6 +187,11 @@ class CaptureLiveEventTests(unittest.TestCase):
             self.assertIn("[REDACTED]", sanitized)
             self.assertTrue(manifest["timedOut"])
             self.assertIn("--ephemeral", manifest["command"])
+            validation = adapter.validate_captured_fixture(
+                sanitized, manifest, expected_roles=("code_explorer",)
+            )
+            self.assertIn("FIXTURE_CAPTURE_TIMED_OUT", validation.reason_codes)
+            self.assertIn("FIXTURE_EXIT_CODE_INVALID", validation.reason_codes)
 
     def test_capture_redacts_json_secret_fields_before_persistence(self) -> None:
         event_stream = json.dumps(
@@ -199,7 +220,7 @@ class CaptureLiveEventTests(unittest.TestCase):
             ), patch.object(
                 capture_module.subprocess, "run", return_value=completed
             ):
-                capture_module.capture(
+                exit_code, output = capture_module.capture(
                     fixture,
                     results,
                     30,
@@ -219,6 +240,15 @@ class CaptureLiveEventTests(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertNotIn("stderr-must-not-survive", manifest)
+            manifest_value = json.loads(manifest)
+            self.assertEqual(1, exit_code)
+            self.assertEqual(1, output["exitCode"])
+            validation = adapter.validate_captured_fixture(
+                persisted,
+                manifest_value,
+                expected_roles=("code_explorer",),
+            )
+            self.assertIn("FIXTURE_EXIT_CODE_INVALID", validation.reason_codes)
 
 
 if __name__ == "__main__":
