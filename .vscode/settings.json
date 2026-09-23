@@ -16,14 +16,16 @@
     "ntdll",
     "ntfs",
     "rereview",
+    "rollouts",
+    "sandboxed",
     "transactionally",
     "ulonglong",
     "unredacted",
+    "unvalidated",
     "whatif",
     "winerror",
     "worktree",
     "worktrees",
-    "xhigh",
-    "sandboxed"
+    "xhigh"
   ]
 }

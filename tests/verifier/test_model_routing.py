@@ -96,7 +96,7 @@ class ModelRoutingTests(unittest.TestCase):
         stream = (
             json.dumps({"type": "thread.started", "thread_id": PARENT}) + "\n"
             + json.dumps(
-                spawn("code_explorer", 0, "gpt-5.6-luna", "low")
+                spawn("code_explorer", 0, "gpt-6-luna", "low")
             )
             + "\n"
             + json.dumps({"type": "turn.completed"}) + "\n"

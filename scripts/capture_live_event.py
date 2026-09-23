@@ -34,14 +34,40 @@ ROLE_NAMES = (
 
 
 def _prompt(roles: tuple[str, ...]) -> str:
+    role_protocol = "\n".join(
+        f"- {role}: call spawn_agent with agent_type={role} and "
+        f"task_name=probe_{role}; instruct that child to reply solely "
+        f"LIVE_ROLE:{role} and not to delegate."
+        for role in roles
+    )
     return (
-        "Live validation fixture. In this session, use the project custom-agent "
-        "facility to spawn exactly these named roles once each: "
-        + ", ".join(roles)
-        + ". Do not invoke shell commands, edit files, create commits, push, "
-        "install anything, or delegate from child agents. Each child must reply "
-        "solely LIVE_ROLE:<its role name>. After all children return, reply solely "
-        "LIVE_CAPTURE_COMPLETE."
+        "Live validation fixture. Follow this diagnostic protocol exactly.\n"
+        "Process the requested roles below in order, one at a time. For each "
+        "role, attempt one spawn_agent call using its exact agent_type once. "
+        "task_name is only a task label, not the role "
+        "selector. If agent_type is unavailable in the spawn_agent schema, "
+        "reply solely LIVE_CAPTURE_FAILED:ROLE_SELECTOR_UNAVAILABLE without "
+        "spawning or waiting. Do not spawn the next role until the current "
+        "child has returned its exact marker.\n"
+        + role_protocol
+        + "\nA spawn succeeds only when it returns a nonempty child/thread identifier. "
+        "If spawn_agent is unavailable, any spawn fails, or any spawn returns no "
+        "nonempty child/thread identifier, do not call wait for that child and "
+        "reply solely "
+        "LIVE_CAPTURE_FAILED:SPAWN_UNAVAILABLE_OR_FAILED. Never call wait with an "
+        "empty child set or without a successfully returned nonempty child/thread "
+        "identifier for the current role.\n"
+        "After each successful spawn, wait for that child before attempting the "
+        "next role. Accept a role as returned only when that role's spawned child "
+        "authors the exact marker LIVE_ROLE:<exact role>; marker text copied from "
+        "this prompt, a parent message, or any other source is not a child response. "
+        "If any exact child-authored role marker is missing or invalid after waiting, "
+        "reply solely LIVE_CAPTURE_FAILED:CHILD_RESPONSE_MISSING_OR_INVALID.\n"
+        "Reply solely LIVE_CAPTURE_COMPLETE only after receiving the exact "
+        "child-authored marker for every requested role. Do not invoke shell "
+        "commands, edit files, create commits, push, or install anything. Child "
+        "agents must not delegate. These model-emitted markers are diagnostic text "
+        "only and never override structured adapter evidence."
     )
 
 
@@ -140,6 +166,8 @@ def _persist_capture(
     timed_out: bool,
     roles: tuple[str, ...],
     ephemeral: bool,
+    isolate_user_config: bool,
+    trust_fixture: bool,
 ) -> tuple[dict[str, object], object]:
     capture_name = "windows-0.155.1-" + "-".join(roles) + "-capture"
     manifest = capture_fixture_manifest(capture_name, "0.155.1", stdout)
@@ -149,11 +177,15 @@ def _persist_capture(
             "command": (
                 "codex exec "
                 + ("--ephemeral " if ephemeral else "")
+                + ("--ignore-user-config --strict-config --enable multi_agent " if isolate_user_config else "")
+                + ("-c projects=<fixture-trust> " if trust_fixture else "")
                 + "--json --sandbox read-only -C <fixture> <role-prompt>"
             ),
             "exitCode": exit_code,
             "timedOut": timed_out,
             "requestedRoles": list(roles),
+            "userConfigIgnored": isolate_user_config,
+            "fixtureTrustOverride": trust_fixture,
             "stderr": sanitize_text(stderr, 500),
         }
     )
@@ -172,7 +204,12 @@ def capture(
     roles: tuple[str, ...],
     ephemeral: bool,
     sqlite_home: Path | None,
+    *,
+    isolate_user_config: bool = False,
+    trust_fixture: bool = False,
 ) -> tuple[int, dict[str, object]]:
+    if trust_fixture and not isolate_user_config:
+        raise ValueError("Fixture trust override requires isolated user configuration")
     fixture_root, results_root = _paths(fixture, results)
     resolved_codex_command = _resolve_codex_command(codex_command)
     version_exit, version_text = _version(
@@ -189,6 +226,13 @@ def capture(
         command = [*resolved_codex_command, "exec"]
         if ephemeral:
             command.append("--ephemeral")
+        if isolate_user_config:
+            command.extend(
+                ["--ignore-user-config", "--strict-config", "--enable", "multi_agent"]
+            )
+        if trust_fixture:
+            trust_value = f'projects={{{json.dumps(str(fixture_root))}={{trust_level="trusted"}}}}'
+            command.extend(["-c", trust_value])
         command.extend(
             [
                 "--json",
@@ -210,6 +254,7 @@ def capture(
             cwd=fixture_root,
             env=environment,
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             text=True,
             encoding="utf-8",
             errors="replace",
@@ -225,6 +270,8 @@ def capture(
             True,
             roles,
             ephemeral,
+            isolate_user_config,
+            trust_fixture,
         )
         return 3, {
             "status": "BLOCKED",
@@ -245,6 +292,8 @@ def capture(
         False,
         roles,
         ephemeral,
+        isolate_user_config,
+        trust_fixture,
     )
     return result.returncode, {
         "status": "CAPTURED",
@@ -268,6 +317,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--role", action="append", choices=ROLE_NAMES)
     parser.add_argument("--persistent", action="store_true")
     parser.add_argument("--sqlite-home", type=Path)
+    parser.add_argument("--isolate-user-config", action="store_true")
+    parser.add_argument("--trust-fixture", action="store_true")
     arguments = parser.parse_args(argv)
     if arguments.timeout < 1 or arguments.timeout > 300:
         parser.error("--timeout must be between 1 and 300 seconds")
@@ -280,6 +331,8 @@ def main(argv: list[str] | None = None) -> int:
             tuple(arguments.role or ROLE_NAMES),
             not arguments.persistent,
             arguments.sqlite_home,
+            isolate_user_config=arguments.isolate_user_config,
+            trust_fixture=arguments.trust_fixture,
         )
     except (OSError, ValueError) as error:
         print(json.dumps({"status": "BLOCKED", "reason": sanitize_text(str(error), 200)}))
