@@ -474,6 +474,13 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual((), result.reason_codes)
         self.assertTrue(result.sanitized)
 
+    def test_new_version_synthetic_fixture_uses_same_fail_closed_schema(self) -> None:
+        raw = complete_stream()
+        manifest = self.manifest(raw, codex_version="0.159.0")
+        result = adapter.validate_captured_fixture(adapter.sanitize_event_stream(raw), manifest)
+        self.assertEqual("schema-conformant", result.conformance)
+        self.assertEqual((), result.reason_codes)
+
     def test_hash_and_version_mismatch_are_rejected(self) -> None:
         raw = complete_stream()
         manifest = self.manifest(raw)

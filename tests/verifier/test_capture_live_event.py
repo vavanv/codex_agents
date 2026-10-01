@@ -206,6 +206,8 @@ class CaptureLiveEventTests(unittest.TestCase):
             manifest = json.loads(
                 (results / "real-capture.manifest.json").read_text(encoding="utf-8")
             )
+            self.assertEqual("0.159.0", manifest["codexVersion"])
+            self.assertEqual("windows-0.159.0-code_explorer-capture", manifest["name"])
             self.assertEqual(["code_explorer"], manifest["requestedRoles"])
             self.assertFalse(manifest["timedOut"])
             self.assertNotIn("--ephemeral", manifest["command"])

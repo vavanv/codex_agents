@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,6 +12,17 @@ import shutil
 import subprocess
 import sys
 import uuid
+
+from live_validation_support import (
+    MARKER_NAME,
+    LiveValidationError,
+    _snapshot_digest,
+    atomic_write_json,
+    capture_git_snapshot,
+    finalize_evidence,
+    utc_now,
+    validate_marker,
+)
 
 from codex_event_adapter import (
     capture_fixture_manifest,
@@ -19,7 +32,7 @@ from codex_event_adapter import (
 )
 
 
-PINNED_CODEX_VERSION = "codex-cli 0.155.1"
+PINNED_CODEX_VERSION = "codex-cli 0.159.0"
 ROLE_NAMES = (
     "code_explorer",
     "quick_implementer",
@@ -168,9 +181,10 @@ def _persist_capture(
     ephemeral: bool,
     isolate_user_config: bool,
     trust_fixture: bool,
+    output_prefix: str = "real-capture",
 ) -> tuple[dict[str, object], object]:
-    capture_name = "windows-0.155.1-" + "-".join(roles) + "-capture"
-    manifest = capture_fixture_manifest(capture_name, "0.155.1", stdout)
+    capture_name = "windows-0.159.0-" + "-".join(roles) + "-capture"
+    manifest = capture_fixture_manifest(capture_name, "0.159.0", stdout)
     manifest.update(
         {
             "reviewed": False,
@@ -191,8 +205,8 @@ def _persist_capture(
     )
     sanitized_stream = sanitize_event_stream(stdout)
     stream = parse_event_stream(sanitized_stream, expected_roles=roles)
-    _write_text(results / "real-capture.sanitized.jsonl", sanitized_stream)
-    _write_json(results / "real-capture.manifest.json", manifest)
+    _write_text(results / f"{output_prefix}.sanitized.jsonl", sanitized_stream)
+    _write_json(results / f"{output_prefix}.manifest.json", manifest)
     return manifest, stream
 
 
@@ -207,6 +221,7 @@ def capture(
     *,
     isolate_user_config: bool = False,
     trust_fixture: bool = False,
+    output_prefix: str = "real-capture",
 ) -> tuple[int, dict[str, object]]:
     if trust_fixture and not isolate_user_config:
         raise ValueError("Fixture trust override requires isolated user configuration")
@@ -272,6 +287,7 @@ def capture(
             ephemeral,
             isolate_user_config,
             trust_fixture,
+            output_prefix,
         )
         return 3, {
             "status": "BLOCKED",
@@ -294,6 +310,7 @@ def capture(
         ephemeral,
         isolate_user_config,
         trust_fixture,
+        output_prefix,
     )
     return result.returncode, {
         "status": "CAPTURED",
@@ -308,10 +325,217 @@ def capture(
     }
 
 
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@contextmanager
+def _owned_run_lock(root: Path):
+    """Serialize through final validation without altering Windows evidence files."""
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = (
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p
+        )
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.ReleaseMutex.argtypes = (ctypes.c_void_p,)
+        kernel32.ReleaseMutex.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_int
+        identity = hashlib.sha256(str(root).casefold().encode("utf-8")).hexdigest()
+        handle = kernel32.CreateMutexW(
+            None, False, f"Global\\CodexOwnedCapture-{identity}"
+        )
+        if not handle:
+            raise OSError("Owned capture mutex could not be created")
+        acquired = False
+        try:
+            wait_result = kernel32.WaitForSingleObject(handle, 0)
+            if wait_result == 0:
+                acquired = True
+                yield
+            elif wait_result == 0x80:
+                acquired = True
+                raise ValueError("Owned capture mutex was abandoned")
+            elif wait_result == 0x102:
+                raise ValueError("Owned capture is already active")
+            else:
+                raise OSError("Owned capture mutex wait failed")
+        finally:
+            if acquired:
+                kernel32.ReleaseMutex(handle)
+            kernel32.CloseHandle(handle)
+        return
+
+    # POSIX locks the stable results directory itself, adding no evidence file.
+    import fcntl
+
+    descriptor = os.open(root / "results", os.O_RDONLY)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            raise ValueError("Owned capture is already active") from error
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def capture_owned_run(
+    run_root: Path,
+    timeout: int,
+    codex_command: str,
+    role: str,
+    *,
+    isolate_user_config: bool = True,
+    trust_fixture: bool = True,
+) -> tuple[int, dict[str, object]]:
+    """Capture one role inside a canonical owned fixture with state bracketing."""
+    if role not in ROLE_NAMES:
+        raise ValueError("Owned capture role is invalid")
+    marker_before_validation = (run_root / MARKER_NAME).read_bytes()
+    root, marker = validate_marker(run_root)
+    if marker["lifecycle"] != "ready" or marker["activeWorkers"]:
+        raise ValueError("Owned fixture is not ready and worker-free")
+    if (root / MARKER_NAME).read_bytes() != marker_before_validation:
+        raise ValueError("Owned fixture marker changed during validation")
+    with _owned_run_lock(root):
+        if (root / MARKER_NAME).read_bytes() != marker_before_validation:
+            raise ValueError("Owned fixture marker changed before capture lock")
+        _, locked_marker = validate_marker(root)
+        if locked_marker["lifecycle"] != "ready" or locked_marker["activeWorkers"]:
+            raise ValueError("Owned fixture is not ready under capture lock")
+        return _capture_owned_locked(
+            root,
+            locked_marker,
+            timeout,
+            codex_command,
+            role,
+            isolate_user_config=isolate_user_config,
+            trust_fixture=trust_fixture,
+        )
+
+
+def _capture_owned_locked(
+    root: Path,
+    marker: dict[str, object],
+    timeout: int,
+    codex_command: str,
+    role: str,
+    *,
+    isolate_user_config: bool,
+    trust_fixture: bool,
+) -> tuple[int, dict[str, object]]:
+    results = root / "results"
+    capture_id = uuid.uuid4().hex
+    prefix = f"capture-{role}-{capture_id}"
+    paths = {
+        "capture": results / f"{prefix}.sanitized.jsonl",
+        "manifest": results / f"{prefix}.manifest.json",
+        "before": results / f"{prefix}.before-snapshot.json",
+        "after": results / f"{prefix}.after-snapshot.json",
+        "sidecar": results / f"{prefix}.snapshot-evidence.json",
+    }
+    sqlite_home = results / "private" / capture_id
+    if any(path.exists() for path in (*paths.values(), sqlite_home)):
+        raise ValueError("Owned capture output already exists")
+    worker_id = str(uuid.uuid4())
+    marker["lifecycle"] = "running"
+    marker["activeWorkers"] = [worker_id]
+    atomic_write_json(root / MARKER_NAME, marker)
+    try:
+        sqlite_home.mkdir(parents=True, exist_ok=False)
+        before = capture_git_snapshot(root, timeout)
+        atomic_write_json(paths["before"], before)
+        started_at = utc_now()
+        capture_failure: BaseException | None = None
+        try:
+            exit_code, output = capture(
+                root / "fixture",
+                results,
+                timeout,
+                codex_command,
+                (role,),
+                False,
+                sqlite_home,
+                isolate_user_config=isolate_user_config,
+                trust_fixture=trust_fixture,
+                output_prefix=prefix,
+            )
+        except BaseException as error:
+            capture_failure = error
+        finally:
+            after = capture_git_snapshot(root, timeout)
+            atomic_write_json(paths["after"], after)
+        if capture_failure is not None:
+            raise capture_failure
+        if not paths["capture"].is_file() or not paths["manifest"].is_file():
+            raise LiveValidationError("Capture did not produce complete evidence")
+        before_digest = _snapshot_digest(before)
+        after_digest = _snapshot_digest(after)
+        sidecar = {
+            "schema": "codex-capture-snapshot/v1",
+            "runId": marker["runId"],
+            "captureId": capture_id,
+            "role": role,
+            "startedAt": started_at,
+            "completedAt": utc_now(),
+            "captureStatus": output["status"],
+            "captureExitCode": exit_code,
+            "files": {
+                kind: {
+                    "path": path.relative_to(root).as_posix(),
+                    "sha256": _sha256_file(path),
+                }
+                for kind, path in paths.items()
+                if kind != "sidecar"
+            },
+            "beforeStateHash": before_digest,
+            "afterStateHash": after_digest,
+            "stateUnchanged": before_digest == after_digest,
+            "runtimeValidated": False,
+        }
+        atomic_write_json(paths["sidecar"], sidecar)
+        marker["lifecycle"] = "ready"
+        marker["activeWorkers"] = []
+        finalize_evidence(root, marker)
+        if not sidecar["stateUnchanged"]:
+            exit_code = 2
+        return exit_code, {
+            "status": (
+                "OWNED_CAPTURED"
+                if exit_code == 0 and sidecar["stateUnchanged"]
+                else "OWNED_CAPTURE_INCOMPLETE"
+            ),
+            "reason": "STATE_DRIFT" if not sidecar["stateUnchanged"] else output.get("reason"),
+            "role": role,
+            "runId": marker["runId"],
+            "captureId": capture_id,
+            "sidecar": paths["sidecar"].relative_to(root).as_posix(),
+            "stateUnchanged": sidecar["stateUnchanged"],
+            "runtimeValidated": False,
+        }
+    except BaseException:
+        marker["lifecycle"] = "interrupted"
+        marker["activeWorkers"] = []
+        try:
+            finalize_evidence(root, marker)
+        except BaseException:
+            atomic_write_json(root / MARKER_NAME, marker)
+        raise
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--fixture", type=Path, required=True)
-    parser.add_argument("--results", type=Path, required=True)
+    parser.add_argument("--fixture", type=Path)
+    parser.add_argument("--results", type=Path)
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--codex-command", default="codex")
     parser.add_argument("--role", action="append", choices=ROLE_NAMES)
@@ -319,23 +543,57 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sqlite-home", type=Path)
     parser.add_argument("--isolate-user-config", action="store_true")
     parser.add_argument("--trust-fixture", action="store_true")
+    parser.add_argument("--owned-run-root", type=Path)
     arguments = parser.parse_args(argv)
     if arguments.timeout < 1 or arguments.timeout > 300:
         parser.error("--timeout must be between 1 and 300 seconds")
     try:
-        exit_code, output = capture(
-            arguments.fixture,
-            arguments.results,
-            arguments.timeout,
-            arguments.codex_command,
-            tuple(arguments.role or ROLE_NAMES),
-            not arguments.persistent,
-            arguments.sqlite_home,
-            isolate_user_config=arguments.isolate_user_config,
-            trust_fixture=arguments.trust_fixture,
+        if arguments.owned_run_root is not None:
+            if arguments.role is None or len(arguments.role) != 1:
+                parser.error("--owned-run-root requires exactly one --role")
+            if (
+                arguments.fixture is not None
+                or arguments.results is not None
+                or arguments.sqlite_home is not None
+                or arguments.persistent
+                or arguments.isolate_user_config
+                or arguments.trust_fixture
+            ):
+                parser.error("--owned-run-root cannot be combined with legacy path or mode flags")
+            exit_code, output = capture_owned_run(
+                arguments.owned_run_root,
+                arguments.timeout,
+                arguments.codex_command,
+                arguments.role[0],
+                isolate_user_config=True,
+                trust_fixture=True,
+            )
+        else:
+            if arguments.fixture is None or arguments.results is None:
+                parser.error("--fixture and --results are required without --owned-run-root")
+            exit_code, output = capture(
+                arguments.fixture,
+                arguments.results,
+                arguments.timeout,
+                arguments.codex_command,
+                tuple(arguments.role or ROLE_NAMES),
+                not arguments.persistent,
+                arguments.sqlite_home,
+                isolate_user_config=arguments.isolate_user_config,
+                trust_fixture=arguments.trust_fixture,
+            )
+    except (OSError, ValueError, LiveValidationError) as error:
+        reason = (
+            "OWNED_CAPTURE_FAILED"
+            if arguments.owned_run_root is not None
+            else sanitize_text(str(error), 200)
         )
-    except (OSError, ValueError) as error:
-        print(json.dumps({"status": "BLOCKED", "reason": sanitize_text(str(error), 200)}))
+        print(json.dumps({"status": "BLOCKED", "reason": reason}))
+        return 4
+    except Exception:
+        if arguments.owned_run_root is None:
+            raise
+        print(json.dumps({"status": "BLOCKED", "reason": "OWNED_CAPTURE_FAILED"}))
         return 4
     print(json.dumps(output, sort_keys=True))
     return exit_code

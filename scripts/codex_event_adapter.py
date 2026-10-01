@@ -9,7 +9,7 @@ attributed before any runtime PASS is considered.
 
 The adapter does **not** establish runtime validation. It understands a
 versioned schema and can attribute a stream deterministically, but until a
-captured, sanitized Codex ``0.155.1`` fixture is reviewed and registered,
+captured, sanitized Codex ``0.155.1`` or ``0.157.1`` fixture is reviewed and registered,
 ``runtimeValidated`` stays ``false`` and a parsed stream is only ever UNVERIFIED.
 """
 
@@ -62,7 +62,7 @@ PASSIVE_ITEM_TYPES = frozenset({"reasoning", "command_execution"})
 # Collaboration tools that carry spawn attribution.
 SPAWN_TOOLS = frozenset({"spawn_agent"})
 
-# Codex 0.155.1 emits ``collab_tool_call`` items using this tool vocabulary.
+# Observed Codex 0.155.1 emits ``collab_tool_call`` items using this tool vocabulary.
 COLLAB_TOOLS = frozenset({"spawn_agent", "send_input", "wait", "close_agent"})
 COLLAB_STATUSES = frozenset({"in_progress", "completed", "failed"})
 COLLAB_AGENT_STATUSES = frozenset(
@@ -418,7 +418,7 @@ def _parse_collab_tool_call(
     expected_roles_explicit: bool,
     reasons: set[str],
 ) -> None:
-    """Validate one Codex 0.155.1 collaboration item and record safe attribution."""
+    """Validate one collaboration item and record safe attribution."""
     item_valid = True
     required_fields = {
         "type",
@@ -780,7 +780,7 @@ def validate_captured_fixture(
     if schema != EVENT_SCHEMA:
         reasons.add("FIXTURE_SCHEMA_UNSUPPORTED")
     version = manifest.get("codexVersion") if isinstance(manifest, dict) else None
-    if version != "0.155.1":
+    if version not in {"0.155.1", "0.157.1", "0.159.0"}:
         reasons.add("FIXTURE_VERSION_MISMATCH")
     capture_hash = manifest.get("captureHash") if isinstance(manifest, dict) else None
     recomputed = _sha256(sanitized_text)

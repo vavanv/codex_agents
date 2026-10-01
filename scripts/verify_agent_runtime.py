@@ -23,10 +23,10 @@ from workflow_manager import CUSTOM_AGENT_FILES, _detect_codex_version
 
 EVIDENCE_SCHEMA = "codex-agent-verification/v1"
 # This parser is intentionally not represented as validated against a captured
-# 0.155.1 stream. Synthetic regression fixtures establish fail-closed behavior,
+# 0.157.1 stream. Synthetic regression fixtures establish fail-closed behavior,
 # not compatibility with a live Codex event schema.
 DISCOVERY_ADAPTER = "codex-cli-jsonl-unvalidated/v1"
-SUPPORTED_RUNTIME_VERSION = "0.155.1"
+SUPPORTED_RUNTIME_VERSIONS = {"0.155.1", "0.157.1", "0.159.0"}
 REASON_CODES = {
     "ATTRIBUTION_CONFLICT",
     "ATTRIBUTION_BEFORE_PARENT",
@@ -288,7 +288,7 @@ def main() -> int:
                 status = "PASS"
                 exit_code = 0
                 reason_codes = ["STATIC_VERIFIED", "DISCOVERY_NOT_REQUESTED"]
-            elif codex_version != SUPPORTED_RUNTIME_VERSION:
+            elif codex_version not in SUPPORTED_RUNTIME_VERSIONS:
                 reason_codes = ["UNSUPPORTED_RUNTIME_VERSION"]
             else:
                 process_result = run_discovery(target, args.timeout)
