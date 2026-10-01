@@ -30,6 +30,7 @@ The invariants are:
 | Workflow release | Codex CLI | Validation date | Status |
 | --- | --- | --- | --- |
 | v0.2 agents preview | `0.155.1` | 2026-09-22 | Contracts and static TOML/lifecycle validation; live behavior pending |
+| v0.2 agents preview | `0.157.1` | 2026-09-27 | Gated static catalog/CLI compatibility; live behavior pending |
 
 Only listed versions are supported. The installer parses `codex --version`, matches an exact supported entry, and validates the source TOML catalog against `compatibility/codex-agents.json` before an opt-in agent installation. An unsupported or unparseable version is a no-write failure. Adding support requires tests for configuration parsing, instruction discovery, sandbox behavior, subagent spawning, and model availability.
 
