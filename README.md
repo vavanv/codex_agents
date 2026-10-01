@@ -9,7 +9,7 @@ Contract-first workflow for using Codex with bounded specialist agents. The inst
 - [CODEX_WORKFLOW.md](CODEX_WORKFLOW.md) — workflow contract.
 - [rules/](rules/) — routing, validation, escalation, and Git-safety rules.
 - [agents/](agents/) — nine opt-in custom-agent definitions.
-- [plan/plan_validated_implementation.md](plan/plan_validated_implementation.md) — current implementation and release status.
+- [plan/plan_validated_finis.md](plan/plan_validated_finis.md) — current implementation, progress, and release status; [plan/plan.md](plan/plan.md) — original design reference.
 
 If this file conflicts with the detailed guide, follow `WORK_FLOW.md` for installation and lifecycle steps and `CODEX_WORKFLOW.md` for workflow semantics.
 
@@ -17,13 +17,13 @@ If this file conflicts with the detailed guide, follow `WORK_FLOW.md` for instal
 
 - Installation is contracts-only by default.
 - `--with-custom-agents` (PowerShell: `-WithCustomAgents`) additionally installs the nine TOML definitions under the target project's `.codex/agents/`.
-- Codex CLI `0.155.1` is the statically supported compatibility-registry version; `runtimeValidated` remains `false`. Python 3.11+ is required for custom-agent validation and installation.
-- As of 2026-09-22, the underscore runtime-role compatibility migration passes static catalog validation, 50 focused installer lifecycle/recovery tests, and all 229 repository tests. Live V3 has started, but its captures have not produced accepted child-role attribution; independent review and the remaining live matrix are still pending, so overall live validation is `NOT READY`.
+- Codex CLI `0.157.1` is the current gated static compatibility-registry version; historical `0.155.1` remains registered. Both have `runtimeValidated: false`. Python 3.11+ is required for custom-agent validation and installation.
+- The `0.157.1` static migration passed the full 351-test repository suite with one skip. Two historical `0.155.1` same-fixture role captures and four `0.157.1` composite captures (`code_explorer`, `code_validator`, `sol_architect`, and `sol_architect_deep`) have bounded one-role acceptance. The other five roles and the full behavioral matrix remain unverified, so overall live validation is `NOT READY`. Current progress is tracked only in [plan/plan_validated_finis.md](plan/plan_validated_finis.md).
 - Legacy `hybrid` names in state, markers, and compatibility identifiers are retained for existing installations; they are not the product branding.
 
 ## Prerequisites
 
-- Codex CLI `0.155.1` (`codex --version`)
+- Codex CLI `0.157.1` (`codex --version`)
 - Python 3 (3.11+ for custom agents)
 - PowerShell 7 on Windows or a POSIX shell on Linux/macOS
 - Write access to the target project
@@ -62,7 +62,7 @@ The target defaults to the current directory when omitted. For manual installati
 Run the package checks from this repository:
 
 ```powershell
-python .\scripts\validate_agent_configs.py --codex-version 0.155.1
+python .\scripts\validate_agent_configs.py --codex-version 0.157.1
 python .\scripts\verify_agent_runtime.py --target "C:\path\to\your-project"
 ```
 

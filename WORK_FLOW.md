@@ -21,7 +21,7 @@ It provides:
 
 Contracts-only installation remains the default. Pass `-WithCustomAgents` on Windows or `--with-custom-agents` on Linux/macOS to validate and install `.codex/agents/*.toml` for the explorer, implementers, architects, escalation agent, validator, reviewer, and `commit_pusher` roles.
 
-Custom agents remain opt-in because Codex CLI `0.155.1` is the statically supported compatibility-registry version and `runtimeValidated` remains `false`. Role isolation is also a layered guardrail, not an immutable security boundary: parent-session settings can override agent defaults, and filesystem read-only mode alone cannot prevent every external side effect.
+Custom agents remain opt-in because Codex CLI `0.157.1` is the current gated static compatibility-registry version and `runtimeValidated` remains `false`. Historical `0.155.1` remains registered for its saved evidence. Role isolation is also a layered guardrail, not an immutable security boundary: parent-session settings can override agent defaults, and filesystem read-only mode alone cannot prevent every external side effect.
 
 With custom agents installed:
 
@@ -34,7 +34,7 @@ With custom agents installed:
 
 Installation, update, recovery, and uninstall remain project-scoped. No global Codex agent configuration is added or replaced, and a conflicting unmanaged project agent causes a fail-closed result before writes.
 
-Deterministic status as of **2026-09-22**: the underscore runtime-role compatibility migration passes static catalog validation, 50 focused installer lifecycle/recovery tests, and all 229 repository tests. Live V3 has started, but the retained captures do not yet provide accepted child-role attribution. Independent review and the remaining live matrix are pending, `runtimeValidated` remains `false`, and overall live validation is **NOT READY**. See the [completion roadmap and live checkpoints](plan/plan_validated_finis.md).
+The `0.157.1` static migration passed the full 351-test repository suite with one skip. Two historical `0.155.1` same-fixture role captures and four `0.157.1` composite captures (`code_explorer`, `code_validator`, `sol_architect`, and `sol_architect_deep`) have bounded one-role acceptance. The other five roles and the full behavioral matrix remain unverified. `runtimeValidated` remains `false` and overall live validation is **NOT READY**. See the [single current status and completion plan](plan/plan_validated_finis.md).
 
 ## Installation scope
 
@@ -64,7 +64,7 @@ Before installation, confirm:
 2. The target project directory already exists.
 3. Python 3 is available; Python 3.11 or newer is required when installing custom agents.
 4. Codex CLI is available on `PATH`.
-5. Codex CLI reports version `0.155.1`, the currently statically supported compatibility-registry version.
+5. Codex CLI reports version `0.157.1`, the current gated static compatibility-registry version.
 6. You have permission to write to the target project.
 
 Windows PowerShell checks:
@@ -88,7 +88,7 @@ test -d "/path/to/your-project"
 Expected Codex output:
 
 ```text
-codex-cli 0.155.1
+codex-cli 0.157.1
 ```
 
 The installer fails before changing project files if the Codex version is unsupported or cannot be determined.
@@ -429,7 +429,7 @@ if ($MissingFiles.Count -eq 0) {
 If custom agents were requested, also validate the package and installed catalog from the workflow package repository:
 
 ```powershell
-python .\scripts\validate_agent_configs.py --codex-version 0.155.1
+python .\scripts\validate_agent_configs.py --codex-version 0.157.1
 python .\scripts\verify_agent_runtime.py --target "C:\path\to\your-project"
 ```
 
@@ -441,7 +441,7 @@ For an optional live diagnostic in a disposable or non-critical project:
 python .\scripts\verify_agent_runtime.py --target "C:\path\to\your-project" --run-codex --evidence ".\agent-discovery.json"
 ```
 
-`--run-codex` is currently a diagnostic probe, not a runtime certification. Even when Codex launches successfully and emits parseable candidates, the event adapter for `0.155.1` has not been validated against captured lifecycle evidence, so both the overall result and discovery remain `UNVERIFIED`, the command exits 3, and it cannot establish runtime PASS.
+`--run-codex` is currently a diagnostic probe, not a runtime certification. The event adapter has no accepted `0.157.1` lifecycle capture; parseable output remains `UNVERIFIED` with exit 3 and cannot establish runtime PASS. Running this probe uses paid inference and needs separate authorization under the live-validation plan.
 
 ### Verify instruction discovery
 
@@ -633,7 +633,7 @@ Codex discovers project instructions from the project root toward the current di
 2. Run `scripts/verify_agent_runtime.py` without `--run-codex` to verify installed content.
 3. Confirm the project is trusted; untrusted projects may skip project-scoped `.codex/` configuration.
 4. Start a new session from the target project root.
-5. Run the optional `--run-codex` diagnostic and inspect its sanitized evidence output. Expect `UNVERIFIED`/exit 3 while the `0.155.1` event adapter remains unvalidated; this is not runtime PASS.
+5. Run the optional `--run-codex` diagnostic only with paid-live authorization and inspect its sanitized evidence output. Expect `UNVERIFIED`/exit 3 while the `0.157.1` event adapter remains unvalidated; this is not runtime PASS.
 
 ## Recommended project adoption sequence
 
@@ -680,4 +680,4 @@ Codex discovers project instructions from the project root toward the current di
 - [scripts/workflow_manager.py](scripts/workflow_manager.py) implements installation transactions.
 - [scripts/validate_agent_configs.py](scripts/validate_agent_configs.py) validates the versioned TOML catalog.
 - [scripts/verify_agent_runtime.py](scripts/verify_agent_runtime.py) verifies installed content and provides the optional live diagnostic probe.
-- [plan/plan_validated_implementation.md](plan/plan_validated_implementation.md) records the current implementation and release status.
+- [plan/plan_validated_finis.md](plan/plan_validated_finis.md) records current implementation, progress, and release status; [plan/plan.md](plan/plan.md) retains the original design scope.
