@@ -24,13 +24,15 @@ class AgentConfigTests(unittest.TestCase):
         )
 
     def test_repository_catalog_is_valid(self) -> None:
-        report = validator.validate_catalog(REPOSITORY_ROOT, "0.155.1")
+        for version in ("0.155.1", "0.157.1", "0.159.0"):
+            with self.subTest(version=version):
+                report = validator.validate_catalog(REPOSITORY_ROOT, version)
+                self.assertTrue(report.passed, report.errors)
+                self.assertEqual(set(validator.EXPECTED_ROLES), set(report.agents))
+                self.assertTrue(any("not yet validated" in warning for warning in report.warnings))
 
-        self.assertTrue(report.passed, report.errors)
-        self.assertEqual(set(validator.EXPECTED_ROLES), set(report.agents))
-
-    def test_supported_versions_lists_single(self) -> None:
-        self.assertEqual({"0.155.1"}, validator.supported_versions(REPOSITORY_ROOT))
+    def test_supported_versions_lists_both_gated_versions(self) -> None:
+        self.assertEqual({"0.155.1", "0.157.1", "0.159.0"}, validator.supported_versions(REPOSITORY_ROOT))
 
     def test_unknown_codex_version_fails(self) -> None:
         report = validator.validate_catalog(REPOSITORY_ROOT, "999.0.0")

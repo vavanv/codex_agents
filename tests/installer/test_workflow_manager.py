@@ -165,6 +165,14 @@ class WorkflowManagerTests(unittest.TestCase):
         with patch.object(manager, "_detect_codex_version", return_value="0.155.1"):
             self.assertEqual("0.155.1", manager._validate_codex_version())
 
+    def test_supported_version_0_157_1_is_accepted(self) -> None:
+        with patch.object(manager, "_detect_codex_version", return_value="0.157.1"):
+            self.assertEqual("0.157.1", manager._validate_codex_version())
+
+    def test_supported_version_0_159_0_is_accepted(self) -> None:
+        with patch.object(manager, "_detect_codex_version", return_value="0.159.0"):
+            self.assertEqual("0.159.0", manager._validate_codex_version())
+
     def test_state_path_cannot_escape_target(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory).resolve()
