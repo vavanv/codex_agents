@@ -25,14 +25,26 @@ The invariants are:
 
 ## 2. Compatibility and precedence
 
-### 2.1 Validated compatibility matrix
+### 2.1 Recorded compatibility checkpoints
 
 | Workflow release | Codex CLI | Validation date | Status |
 | --- | --- | --- | --- |
 | v0.2 agents preview | `0.155.1` | 2026-09-22 | Contracts and static TOML/lifecycle validation; live behavior pending |
 | v0.2 agents preview | `0.157.1` | 2026-09-27 | Gated static catalog/CLI compatibility; live behavior pending |
+| v0.2 agents preview | `0.159.0` | 2026-09-30 | Historical fixture version; static catalog support, live gate not accepted |
+| v0.2 agents preview | `0.159.3` | 2026-10-03 | Static catalog and source-bound L0-L6 accepted; L7 unaccepted, L8 task evidence repaired but sandbox checks FAIL, seven L8 cases not run; L9-L17 pending; runtime not validated |
+| v0.2 agents preview | `0.160.0` | 2026-10-03 | Static installation candidate; 120 independent tests PASS and review APPROVE; native installed, provenance BLOCKED; no fresh L0-L17 accepted; runtime not validated |
 
-Only listed versions are supported. The installer parses `codex --version`, matches an exact supported entry, and validates the source TOML catalog against `compatibility/codex-agents.json` before an opt-in agent installation. An unsupported or unparseable version is a no-write failure. Adding support requires tests for configuration parsing, instruction discovery, sandbox behavior, subagent spawning, and model availability.
+<!-- codex-policy-reference:begin -->
+In the package source repository, codex_version.md#current-version-policy
+contains the current registry-backed version policy.
+That summary and compatibility/codex-agents.json are not installed in the target
+project. Consult the package source before installation or update.
+Release readiness remains NOT_READY; serving-backend/effective-policy provenance
+remains BLOCKED. No registered version is runtime validated.
+<!-- codex-policy-reference:end -->
+
+Static installation requires an eligible entry in the package source registry. The installer parses `codex --version`, matches an exact supported entry, and validates the source TOML catalog against `compatibility/codex-agents.json` before an opt-in agent installation. An unsupported or unparseable version is a no-write failure. Full runtime support requires accepted version-bound tests for configuration parsing, instruction discovery, sandbox behavior, subagent spawning, and model availability. Static installation candidacy permits catalog and installer validation while runtime gates remain closed.
 
 The v0.1 schema uses:
 

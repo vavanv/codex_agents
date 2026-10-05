@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -9,12 +11,15 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
+from types import SimpleNamespace
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 
 import verify_agent_runtime as verifier
+import codex_compatibility as compatibility
+import validate_agent_configs as catalog
 
 
 class VerifyAgentRuntimeTests(unittest.TestCase):
@@ -366,6 +371,181 @@ class VerifyAgentRuntimeTests(unittest.TestCase):
         self.assertEqual(1, exit_code)
         self.assertTrue(output.startswith("FAIL:"))
         self.assertNotIn("secret path", output)
+
+
+class DiscoveryPolicyTests(unittest.TestCase):
+    def setUp(self):
+        disposable = tempfile.TemporaryDirectory()
+        self.addCleanup(disposable.cleanup)
+        self.directory = Path(disposable.name)
+        self.source = self.directory / "source"
+        self.target = self.directory / "target"
+        self.target.mkdir()
+        (self.source / "compatibility").mkdir(parents=True)
+        self.registry_path = self.source / "compatibility/codex-agents.json"
+        self.registry_path.write_bytes((REPOSITORY_ROOT / "compatibility/codex-agents.json").read_bytes())
+        self.document = json.loads(self.registry_path.read_bytes())
+        for source_relative, installed_relative in verifier.CUSTOM_AGENT_FILES.items():
+            source = self.source / source_relative
+            source.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(REPOSITORY_ROOT / source_relative, source)
+            target = self.target / installed_relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+        self.evidence_path = self.directory / "evidence.json"
+
+    def write_policy(self):
+        self.registry_path.write_text(json.dumps(self.document), encoding="utf-8")
+
+    def invoke(self, version="0.155.1", run_codex=True, detect_side_effect=None):
+        arguments = ["verify", "--target", str(self.target), "--source-root", str(self.source),
+                     "--evidence", str(self.evidence_path)]
+        if run_codex:
+            arguments.append("--run-codex")
+        process = verifier.DiscoveryProcessResult(0,
+            '{"type":"thread.started","thread_id":"00000000-0000-4000-8000-000000000001"}\n',
+            "", False, None)
+        with patch.object(sys, "argv", arguments), \
+             patch.object(verifier, "_detect_codex_version", return_value=version,
+                          side_effect=detect_side_effect) as detect, \
+             patch.object(verifier, "run_discovery", return_value=process) as discover, \
+             redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            result = verifier.main()
+        return result, json.loads(self.evidence_path.read_bytes()), detect, discover
+
+    def test_independent_discovery_matrix_and_static_only_verification(self):
+        oracle = {"0.155.1": 3, "0.157.1": 3, "0.159.0": 3, "0.159.3": 3, "0.160.0": 1}
+        for version, expected_exit in oracle.items():
+            with self.subTest(version=version):
+                result, evidence, _, discover = self.invoke(version)
+                self.assertEqual(expected_exit, result)
+                self.assertEqual("PASS", evidence["installation"])
+                if expected_exit == 3:
+                    self.assertEqual("UNVERIFIED", evidence["status"])
+                    self.assertIn("UNVALIDATED_EVENT_ADAPTER", evidence["reasonCodes"])
+                    discover.assert_called_once()
+                else:
+                    self.assertEqual("FAIL", evidence["status"])
+                    self.assertEqual(["UNSUPPORTED_RUNTIME_VERSION"], evidence["reasonCodes"])
+                    discover.assert_not_called()
+        result, evidence, _, discover = self.invoke("0.160.0", run_codex=False)
+        self.assertEqual(0, result)
+        self.assertEqual("PASS", evidence["status"])
+        discover.assert_not_called()
+
+    def test_changed_discovery_gate_is_enforced_without_changing_static_gate(self):
+        self.document["versions"]["0.159.3"]["gates"]["discoveryDiagnostic"] = False
+        self.write_policy()
+        result, evidence, _, discover = self.invoke("0.159.3")
+        self.assertEqual(1, result)
+        self.assertEqual("PASS", evidence["installation"])
+        self.assertEqual(["UNSUPPORTED_RUNTIME_VERSION"], evidence["reasonCodes"])
+        discover.assert_not_called()
+        result, evidence, _, discover = self.invoke("0.159.3", run_codex=False)
+        self.assertEqual(0, result)
+        self.assertEqual("PASS", evidence["installation"])
+        discover.assert_not_called()
+
+    def test_one_bound_snapshot_reaches_real_catalog_after_registry_bytes_change(self):
+        original_loader = verifier.load_registry
+        captured = []
+        def change_bytes(source):
+            registry = original_loader(source)
+            captured.append(registry)
+            self.registry_path.write_bytes(b"changed after immutable snapshot")
+            return registry
+        with patch.object(verifier, "load_registry", side_effect=change_bytes) as loaded, \
+             patch.object(catalog, "load_registry", side_effect=AssertionError("nested policy reload")), \
+             patch.object(verifier, "validate_catalog", wraps=verifier.validate_catalog) as validate, \
+             patch.object(verifier, "verify_installed", wraps=verifier.verify_installed) as installed:
+            result, evidence, _, discover = self.invoke()
+        self.assertEqual(3, result)
+        self.assertEqual("PASS", evidence["installation"])
+        loaded.assert_called_once_with(self.source)
+        self.assertIs(captured[0], installed.call_args.kwargs["policy"])
+        self.assertIs(captured[0], validate.call_args.kwargs["policy"])
+        discover.assert_called_once()
+
+    def test_policy_corruption_missing_and_unsafe_paths_fail_before_version_probe(self):
+        original = self.registry_path.read_bytes()
+        for content in (b"bad JSON", b'{"schemaVersion":1,"schemaVersion":1}', None):
+            for run_codex in (False, True):
+                with self.subTest(content=content, run_codex=run_codex):
+                    if content is None:
+                        self.registry_path.unlink(missing_ok=True)
+                    else:
+                        self.registry_path.write_bytes(content)
+                    result, evidence, detect, discover = self.invoke(run_codex=run_codex)
+                    self.assertEqual(1, result)
+                    self.assertIsNone(evidence["codexVersion"])
+                    self.assertEqual(["CODEX_VERSION_ERROR"], evidence["reasonCodes"])
+                    detect.assert_not_called()
+                    discover.assert_not_called()
+                    self.registry_path.write_bytes(original)
+        original_lstat = Path.lstat
+        original_resolve = Path.resolve
+        def unsafe_metadata(path, *args, **kwargs):
+            metadata = original_lstat(path, *args, **kwargs)
+            if path == self.source:
+                return SimpleNamespace(st_mode=metadata.st_mode, st_file_attributes=0x400)
+            return metadata
+        def source_must_not_resolve(path, *args, **kwargs):
+            if path.is_relative_to(self.source):
+                raise AssertionError("unsafe source resolved before check")
+            return original_resolve(path, *args, **kwargs)
+        with patch.object(Path, "lstat", unsafe_metadata), patch.object(Path, "resolve", source_must_not_resolve):
+            result, evidence, detect, discover = self.invoke()
+        self.assertEqual(1, result)
+        self.assertEqual(["CODEX_VERSION_ERROR"], evidence["reasonCodes"])
+        detect.assert_not_called()
+        discover.assert_not_called()
+
+    def test_foreign_policy_rejected_before_probe_or_agent_reads(self):
+        foreign = self.directory / "foreign"
+        (foreign / "compatibility").mkdir(parents=True)
+        (foreign / "compatibility/codex-agents.json").write_bytes(self.registry_path.read_bytes())
+        registry = compatibility.load_registry(foreign)
+        with patch.object(verifier, "load_registry", return_value=registry), \
+             patch.object(verifier, "verify_installed", side_effect=AssertionError("foreign policy reached agent reads")):
+            result, evidence, detect, discover = self.invoke()
+        self.assertEqual(1, result)
+        self.assertEqual(["CODEX_VERSION_ERROR"], evidence["reasonCodes"])
+        detect.assert_not_called()
+        discover.assert_not_called()
+        with patch.object(verifier, "validate_catalog", side_effect=AssertionError("foreign policy reached catalog")), \
+             patch.object(Path, "read_bytes", side_effect=AssertionError("foreign policy read agent")):
+            with self.assertRaises(compatibility.RegistryError) as caught:
+                verifier.verify_installed(self.target, self.source, "0.155.1", policy=registry)
+        self.assertEqual("source_mismatch", caught.exception.category)
+
+    def test_catalog_failure_returns_before_installed_agent_byte_reads(self):
+        registry = compatibility.load_registry(self.source)
+        with patch.object(Path, "read_bytes", side_effect=AssertionError("invalid catalog reached agent byte reads")):
+            errors = verifier.verify_installed(self.target, self.source, "999.0.0", policy=registry)
+        self.assertEqual(["unsupported Codex CLI version: 999.0.0"], errors)
+        (self.source / "agents/code-explorer.toml").write_bytes(b'name = "unterminated\n')
+        with patch.object(Path, "read_bytes", side_effect=AssertionError("invalid TOML reached installed bytes")):
+            errors = verifier.verify_installed(self.target, self.source, "0.155.1", policy=registry)
+        self.assertTrue(any("invalid TOML" in error for error in errors))
+
+    def test_library_loads_once_and_unrelated_cwd_uses_explicit_source(self):
+        with patch.object(verifier, "load_registry", wraps=verifier.load_registry) as loaded, \
+             patch.object(catalog, "load_registry", side_effect=AssertionError("catalog reread policy")):
+            self.assertEqual([], verifier.verify_installed(self.target, self.source, "0.160.0"))
+        loaded.assert_called_once_with(self.source)
+        unrelated = self.directory / "unrelated"
+        unrelated.mkdir()
+        prior = Path.cwd()
+        os.chdir(unrelated)
+        try:
+            with patch.dict(os.environ, {"CODEX_SOURCE_ROOT": str(unrelated), "CODEX_VERSION": "0.160.0"}):
+                result, evidence, _, discover = self.invoke("0.159.3")
+        finally:
+            os.chdir(prior)
+        self.assertEqual(3, result)
+        self.assertEqual("0.159.3", evidence["codexVersion"])
+        self.assertEqual("PASS", evidence["installation"])
+        discover.assert_called_once()
 
 
 if __name__ == "__main__":

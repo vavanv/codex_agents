@@ -7,6 +7,7 @@ import json
 import sys
 import tomllib
 import unittest
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,6 +17,7 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 
 import codex_event_adapter as adapter
 import reconcile_codex_rollouts as reconciliation
+import codex_compatibility as compatibility
 
 
 PARENT = "00000000-0000-4000-8000-000000000001"
@@ -188,7 +190,7 @@ def run_case(
     )
 
 
-def v2_fixture(role: str = "code_reviewer", version: str = "0.159.0") -> tuple[bytes, dict, list[dict], list[dict]]:
+def v2_fixture(role: str = "code_reviewer", version: str = "0.159.3") -> tuple[bytes, dict, list[dict], list[dict]]:
     capture, manifest, parent, child = fixture(role, version)
     child[0]["payload"].pop("forked_from_id")
     child[0]["payload"]["multi_agent_version"] = "v2"
@@ -198,6 +200,52 @@ def v2_fixture(role: str = "code_reviewer", version: str = "0.159.0") -> tuple[b
 
 
 class ReconciliationTests(unittest.TestCase):
+    def test_policy_rollout_matrix_preserves_exact_versions(self) -> None:
+        for version, schemas in {"0.155.1": ("v1",), "0.157.1": ("v1", "v2"),
+                                 "0.159.0": ("v1", "v2"), "0.159.3": ("v1", "v2"),
+                                 "0.160.0": ()}.items():
+            for variant in ("v1", "v2"):
+                with self.subTest(version=version, variant=variant):
+                    values = fixture(version=version) if variant == "v1" else v2_fixture("code_explorer", version)
+                    result = run_case(*values, rollout_variant=variant)
+                    self.assertEqual(variant in schemas, result["status"] == "CORRELATED")
+                    if variant not in schemas:
+                        self.assertIn("CAPTURE_MANIFEST_INVALID", result["reasonCodes"])
+        capture, manifest, parent, child = fixture(version="0.159.3")
+        parent[0]["payload"]["cli_version"] = "0.159.0"
+        self.assertIn("PARENT_SESSION_MISMATCH", run_case(capture, manifest, parent, child)["reasonCodes"])
+
+    def test_policy_gate_and_binding_errors_do_not_become_evidence_reasons(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "compatibility").mkdir()
+            path = root / "compatibility/codex-agents.json"
+            document = json.loads((REPOSITORY_ROOT / "compatibility/codex-agents.json").read_bytes())
+            document["versions"]["0.155.1"]["gates"]["capturedEvidence"] = False
+            document["versions"]["0.155.1"]["rolloutSchemas"] = []
+            path.write_text(json.dumps(document), encoding="utf-8")
+            registry = compatibility.load_registry(root)
+            capture, manifest, parent, child = fixture()
+            result = reconciliation.reconcile_rollouts(capture, manifest, encoded(parent), encoded(child), CONFIG,
+                                                       role=ROLE, source_root=root, policy=registry)
+            self.assertIn("CAPTURE_MANIFEST_INVALID", result["reasonCodes"])
+            with patch.object(reconciliation, "_rollout_rows", side_effect=AssertionError("foreign policy parsed rollout")):
+                with self.assertRaises(compatibility.RegistryError):
+                    reconciliation.reconcile_rollouts(capture, manifest, encoded(parent), encoded(child), CONFIG,
+                                                       role=ROLE, policy=registry)
+            path.write_bytes(b"corrupt")
+            with self.assertRaises(compatibility.RegistryError):
+                reconciliation.reconcile_rollouts(capture, manifest, encoded(parent), encoded(child), CONFIG,
+                                                   role=ROLE, source_root=root)
+
+    def test_cli_policy_failure_precedes_evidence_reads(self) -> None:
+        args = ["--capture", "capture", "--manifest", "manifest", "--parent-rollout", "parent",
+                "--child-rollout", "child", "--agent-config", "agent", "--role", ROLE]
+        with patch.object(reconciliation, "load_registry", side_effect=compatibility.RegistryError("malformed_policy", "bad")), \
+             patch.object(reconciliation, "_read_limited", side_effect=AssertionError("evidence read before policy")), \
+             redirect_stdout(io.StringIO()):
+            self.assertEqual(2, reconciliation.main(args))
+
     def test_v2_context_correlates_only_as_separate_schema(self) -> None:
         capture, manifest, parent, child = v2_fixture()
         result = run_case(capture, manifest, parent, child, role="code_reviewer",

@@ -53,10 +53,26 @@ def evaluate_model_routing(
     model/effort. Unattributed roles and missing observed metadata are
     UNVERIFIED; a configured/observed mismatch is FAIL.
     """
+    return evaluate_routing_observations(
+        configured, attributed_children=attribution.attributed_children,
+        observed_models=attribution.observed_models,
+        observed_efforts=attribution.observed_efforts, expected_roles=expected_roles,
+    )
+
+
+def evaluate_routing_observations(
+    configured: Mapping[str, Mapping[str, str]], *,
+    attributed_children: Mapping[str, str],
+    observed_models: Mapping[str, str],
+    observed_efforts: Mapping[str, str],
+    expected_roles: tuple[str, ...] | None = None,
+) -> tuple[ModelRoutingVerdict, ...]:
+    """Compare already attributed observations; callers retain their source type.
+
+    This is shared comparison logic, not an attribution or acceptance validator.
+    Private-context callers must establish role/session/task linkage first.
+    """
     expected_roles = tuple(sorted(expected_roles or EXPECTED_ROLES))
-    attributed_children = attribution.attributed_children
-    observed_models = attribution.observed_models
-    observed_efforts = attribution.observed_efforts
     verdicts: list[ModelRoutingVerdict] = []
     for role in expected_roles:
         config = configured.get(role)
@@ -72,14 +88,14 @@ def evaluate_model_routing(
                 reasons.append("MISSING_OBSERVED_MODEL")
             if observed_effort is None:
                 reasons.append("MISSING_OBSERVED_EFFORT")
-        if reasons:
+            if observed_model is not None and observed_model != configured_model:
+                reasons.append("MODEL_MISMATCH")
+            if observed_effort is not None and observed_effort != configured_effort:
+                reasons.append("EFFORT_MISMATCH")
+        if {"MODEL_MISMATCH", "EFFORT_MISMATCH"}.intersection(reasons):
+            verdict = "FAIL"
+        elif reasons:
             verdict = "UNVERIFIED"
-        elif observed_model != configured_model:
-            reasons.append("MODEL_MISMATCH")
-            verdict = "FAIL"
-        elif observed_effort != configured_effort:
-            reasons.append("EFFORT_MISMATCH")
-            verdict = "FAIL"
         else:
             verdict = "PASS"
         verdicts.append(

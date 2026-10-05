@@ -22,6 +22,9 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+from pathlib import Path
+
+from codex_compatibility import CompatibilityRegistry, RegistryError, load_registry, require_gate, require_source_root
 
 from validate_agent_configs import EXPECTED_ROLES
 
@@ -759,6 +762,8 @@ def validate_captured_fixture(
     manifest: dict[str, Any],
     *,
     expected_roles: tuple[str, ...] | None = None,
+    source_root: Path | None = None,
+    policy: CompatibilityRegistry | None = None,
 ) -> FixtureValidation:
     """Validate a sanitized captured fixture against the versioned contract.
 
@@ -766,6 +771,9 @@ def validate_captured_fixture(
     coherent terminal/call attribution gate. ``expected_roles`` defaults to the
     full catalog so a partial fixture is a non-conformant result.
     """
+    root = source_root if source_root is not None else Path(__file__).absolute().parent.parent
+    registry = policy if policy is not None else load_registry(root)
+    require_source_root(registry, root)
     normalized_roles, roles_valid, _ = _normalize_expected_roles(expected_roles)
     reasons: set[str] = set()
     if not roles_valid:
@@ -780,7 +788,11 @@ def validate_captured_fixture(
     if schema != EVENT_SCHEMA:
         reasons.add("FIXTURE_SCHEMA_UNSUPPORTED")
     version = manifest.get("codexVersion") if isinstance(manifest, dict) else None
-    if version not in {"0.155.1", "0.157.1", "0.159.0"}:
+    try:
+        require_gate(registry, version, "capturedEvidence")
+    except RegistryError as error:
+        if error.category not in {"unknown_version", "denied_gate"}:
+            raise
         reasons.add("FIXTURE_VERSION_MISMATCH")
     capture_hash = manifest.get("captureHash") if isinstance(manifest, dict) else None
     recomputed = _sha256(sanitized_text)
@@ -841,6 +853,4 @@ def validate_captured_fixture(
         reason_codes=tuple(sorted(reasons)),
         attribution=attribution,
     )
-
-
 

@@ -16,6 +16,7 @@ import sys
 from typing import Any
 
 from codex_event_adapter import sanitize_event_stream, validate_captured_fixture
+from codex_compatibility import CompatibilityRegistry, load_registry, require_source_root
 from reconcile_codex_rollouts import (
     EVIDENCE_SCHEMA,
     V2_EVIDENCE_SCHEMA,
@@ -169,8 +170,13 @@ def validate_composite_fixture(
     review_bytes: bytes | None = None,
     role: str = PINNED_ROLE,
     rollout_variant: str = "v1",
+    source_root: Path | None = None,
+    policy: CompatibilityRegistry | None = None,
 ) -> dict[str, Any]:
     """Return fail-closed one-role acceptance from two distinct evidence sources."""
+    root = source_root if source_root is not None else Path(__file__).absolute().parent.parent
+    registry = policy if policy is not None else load_registry(root)
+    require_source_root(registry, root)
     base: dict[str, Any] = {
         "schema": V2_COMPOSITE_SCHEMA if rollout_variant == "v2" else COMPOSITE_SCHEMA,
         "scope": role if isinstance(role, str) and role in PINNED_ROLE_CONFIG_HASHES else "unsupported",
@@ -204,7 +210,7 @@ def validate_composite_fixture(
         return base
 
     public = validate_captured_fixture(
-        capture_text, manifest, expected_roles=(role,)
+        capture_text, manifest, expected_roles=(role,), source_root=root, policy=registry,
     )
     public_reasons = set(public.reason_codes)
     if manifest.get("reviewed") is not False or public_reasons != PUBLIC_GAPS:
@@ -219,6 +225,7 @@ def validate_composite_fixture(
         agent_config,
         role=role,
         rollout_variant=rollout_variant,
+        source_root=root, policy=registry,
     )
     if (
         evidence.get("status") != "CORRELATED"
@@ -284,6 +291,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rollout-variant", choices=("v1", "v2"), default="v1")
     args = parser.parse_args(argv)
     try:
+        source_root = Path(__file__).absolute().parent.parent
+        registry = load_registry(source_root)
+        require_source_root(registry, source_root)
         result = validate_composite_fixture(
             _read_limited(args.capture),
             _read_limited(args.manifest),
@@ -293,6 +303,7 @@ def main(argv: list[str] | None = None) -> int:
             review_bytes=_read_limited(args.review) if args.review is not None else None,
             role=args.role,
             rollout_variant=args.rollout_variant,
+            source_root=source_root, policy=registry,
         )
     except (OSError, ValueError):
         result = {

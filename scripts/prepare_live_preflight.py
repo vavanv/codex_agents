@@ -11,7 +11,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from capture_live_event import PINNED_CODEX_VERSION, _owned_run_lock, _resolve_codex_command
+from capture_live_event import LegacyRunIdentity, _legacy_identity, _owned_run_lock, _resolve_codex_command
+from codex_compatibility import CompatibilityRegistry
 from live_validation_support import (
     _snapshot_digest,
     atomic_write_json,
@@ -44,8 +45,13 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def prepare(source_root: Path, timeout: int, codex_command: str) -> dict[str, object]:
+def prepare(
+    source_root: Path, timeout: int, codex_command: str, *,
+    policy: CompatibilityRegistry | None = None,
+    _identity: LegacyRunIdentity | None = None,
+) -> dict[str, object]:
     """Return allowlisted preflight facts without creating a fixture or running a model."""
+    identity = _identity or _legacy_identity(source_root, policy)
     if timeout < 1 or timeout > 300:
         raise ValueError("Timeout must be between 1 and 300 seconds")
     source = source_root.resolve(strict=True)
@@ -60,7 +66,7 @@ def prepare(source_root: Path, timeout: int, codex_command: str) -> dict[str, ob
         raise ValueError("The agent catalog does not contain exactly nine known roles")
 
     codex_version = _version([*_resolve_codex_command(codex_command), "--version"], timeout)
-    if codex_version != PINNED_CODEX_VERSION:
+    if codex_version != identity.profile.cli_banner:
         raise ValueError("The active Codex CLI does not match the pinned version")
     git = shutil.which("git")
     powershell = shutil.which("pwsh") or shutil.which("powershell")
@@ -79,7 +85,7 @@ def prepare(source_root: Path, timeout: int, codex_command: str) -> dict[str, ob
         "pythonVersion": platform.python_version(),
         "gitVersion": git_version,
         "powershellVersion": powershell_version,
-        "configurationSha256": _sha256(config),
+        "configurationSha256": identity.policy.sha256,
         "sourceAgentSha256": {
             role: _sha256(agents / f"{stem}.toml")
             for stem, role in sorted(AGENT_FILE_ROLES.items())
@@ -92,9 +98,11 @@ def prepare(source_root: Path, timeout: int, codex_command: str) -> dict[str, ob
 
 
 def bind_fixture(
-    source_root: Path, run_root: Path, timeout: int, codex_command: str
+    source_root: Path, run_root: Path, timeout: int, codex_command: str, *,
+    policy: CompatibilityRegistry | None = None,
 ) -> dict[str, object]:
     """Bind the source preflight to an owned, installed fixture before capture."""
+    identity = _legacy_identity(source_root, policy)
     root, _ = validate_marker(run_root)
     with _owned_run_lock(root):
         _, marker = validate_marker(root)
@@ -105,7 +113,9 @@ def bind_fixture(
             raise ValueError("The owned fixture already has a bound preflight")
         fixture = root / "fixture"
         installed = fixture / ".codex" / "agents"
-        source_preflight = prepare(source_root, timeout, codex_command)
+        source_preflight = prepare(
+            source_root, timeout, codex_command, policy=identity.policy, _identity=identity
+        )
         installed_hashes = {}
         for stem, role in sorted(AGENT_FILE_ROLES.items()):
             path = installed / f"{stem}.toml"
@@ -134,7 +144,7 @@ def bind_fixture(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--source-root", type=Path, default=Path(__file__).absolute().parent.parent)
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--codex-command", default="codex")
     parser.add_argument("--owned-run-root", type=Path)

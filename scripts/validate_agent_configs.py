@@ -11,6 +11,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+if __package__:
+    from .codex_compatibility import (
+        CompatibilityRegistry, RegistryError, load_registry, require_gate, require_source_root,
+        versions_for_gate,
+    )
+else:
+    from codex_compatibility import (
+        CompatibilityRegistry, RegistryError, load_registry, require_gate, require_source_root,
+        versions_for_gate,
+    )
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - exercised only on Python older than 3.11
@@ -70,22 +81,13 @@ class ValidationReport:
         }
 
 
-def _load_json(path: Path) -> dict[str, Any]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(f"registry is not valid JSON: {path}: {error}") from error
-    if not isinstance(value, dict):
-        raise ValueError(f"registry root must be an object: {path}")
-    return value
-
-
-def supported_versions(source_root: Path) -> set[str]:
-    registry = _load_json(source_root / REGISTRY_PATH)
-    versions = registry.get("versions")
-    if not isinstance(versions, dict) or not versions:
-        raise ValueError("registry must define a non-empty versions object")
-    return set(versions)
+def supported_versions(
+    source_root: Path, *, policy: CompatibilityRegistry | None = None,
+) -> set[str]:
+    registry = policy if policy is not None else load_registry(source_root)
+    if policy is not None:
+        require_source_root(registry, source_root)
+    return set(versions_for_gate(registry, "staticInstallation"))
 
 
 def configured_models(source_root: Path) -> dict[str, dict[str, str]]:
@@ -120,7 +122,9 @@ def configured_models(source_root: Path) -> dict[str, dict[str, str]]:
     return result
 
 
-def validate_catalog(source_root: Path, codex_version: str) -> ValidationReport:
+def validate_catalog(
+    source_root: Path, codex_version: str, *, policy: CompatibilityRegistry | None = None,
+) -> ValidationReport:
     errors: list[str] = []
     warnings: list[str] = []
     parsed_names: list[str] = []
@@ -134,38 +138,20 @@ def validate_catalog(source_root: Path, codex_version: str) -> ValidationReport:
         )
 
     try:
-        registry = _load_json(source_root / REGISTRY_PATH)
-    except ValueError as error:
-        return ValidationReport(codex_version, (str(error),), (), ())
+        registry = policy if policy is not None else load_registry(source_root)
+        if policy is not None:
+            require_source_root(registry, source_root)
+        version_config = require_gate(registry, codex_version, "staticInstallation")
+    except RegistryError as error:
+        message = (f"unsupported Codex CLI version: {codex_version}"
+                   if error.category in {"unknown_version", "denied_gate"} else str(error))
+        return ValidationReport(codex_version, (message,), (), ())
 
-    if registry.get("schemaVersion") != 1:
-        errors.append("compatibility registry schemaVersion must be 1")
-    versions = registry.get("versions")
-    if not isinstance(versions, dict):
-        errors.append("compatibility registry versions must be an object")
-        return ValidationReport(codex_version, tuple(errors), (), ())
-    version_config = versions.get(codex_version)
-    if not isinstance(version_config, dict):
-        errors.append(f"unsupported Codex CLI version: {codex_version}")
-        return ValidationReport(codex_version, tuple(errors), (), ())
-
-    required_keys = version_config.get("requiredKeys")
-    allowed_keys = version_config.get("allowedKeys")
-    sandbox_modes = version_config.get("sandboxModes")
-    models = version_config.get("models")
-    if not isinstance(required_keys, list) or not all(isinstance(key, str) for key in required_keys):
-        errors.append("requiredKeys must be a string array")
-        required_keys = []
-    if not isinstance(allowed_keys, list) or not all(isinstance(key, str) for key in allowed_keys):
-        errors.append("allowedKeys must be a string array")
-        allowed_keys = []
-    if not isinstance(sandbox_modes, list) or not all(isinstance(mode, str) for mode in sandbox_modes):
-        errors.append("sandboxModes must be a string array")
-        sandbox_modes = []
-    if not isinstance(models, dict):
-        errors.append("models must be an object")
-        models = {}
-    if version_config.get("runtimeValidated") is not True:
+    required_keys = version_config.required_keys
+    allowed_keys = version_config.allowed_keys
+    sandbox_modes = version_config.sandbox_modes
+    models = version_config.models
+    if not version_config.runtime_validated:
         warnings.append(f"runtime behavior is not yet validated for Codex CLI {codex_version}")
 
     agents_directory = source_root / AGENTS_DIRECTORY
@@ -211,8 +197,8 @@ def validate_catalog(source_root: Path, codex_version: str) -> ValidationReport:
 
         model = value.get("model")
         effort = value.get("model_reasoning_effort")
-        allowed_efforts = models.get(model)
-        if not isinstance(model, str) or not isinstance(allowed_efforts, list):
+        allowed_efforts = models.get(model) if isinstance(model, str) else None
+        if allowed_efforts is None:
             errors.append(f"{path.name}: unsupported model: {model!r}")
         elif effort not in allowed_efforts:
             errors.append(f"{path.name}: unsupported reasoning effort {effort!r} for {model}")
@@ -245,7 +231,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--source-root",
         type=Path,
-        default=Path(__file__).resolve().parent.parent,
+        default=Path(__file__).absolute().parent.parent,
         help="Workflow package root",
     )
     parser.add_argument("--codex-version", required=True, help="Codex CLI version to validate")
@@ -255,7 +241,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _parser().parse_args()
-    report = validate_catalog(args.source_root.resolve(), args.codex_version)
+    report = validate_catalog(args.source_root.absolute(), args.codex_version)
     if args.json:
         print(json.dumps(report.to_json(), indent=2, sort_keys=True))
     else:

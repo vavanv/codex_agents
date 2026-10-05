@@ -328,6 +328,8 @@ class RepositoryAdapterTests(unittest.TestCase):
         Inventory().visit(tree)
         approved = Counter(
             {
+                # Package-owned policy root normalization; no target I/O.
+                ("_load_policy", "absolute"): 1,
                 ("PathRepositoryAdapter.observe_root_identity", "lstat"): 1,
                 ("PathRepositoryAdapter.mkdir", "mkdir"): 1,
                 ("WindowsRepositoryAdapter.exists", "exists"): 1,
@@ -354,7 +356,8 @@ class RepositoryAdapterTests(unittest.TestCase):
                 ("_validate_sources", "is_file"): 1,
                 ("_validate_sources", "is_symlink"): 1,
                 ("_install_with_adapter", "read_bytes"): 1,
-                ("main", "resolve"): 1,
+                # Lexical package-source default preserves link ancestry for the strict loader.
+                ("main", "absolute"): 1,
             }
         )
         self.assertEqual(approved, observed)

@@ -20,6 +20,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn, Protocol
 
+if __package__:
+    from .codex_compatibility import (
+        CompatibilityRegistry, RegistryError, load_registry, require_gate, require_source_root, version_info,
+        versions_for_gate,
+    )
+else:
+    from codex_compatibility import (
+        CompatibilityRegistry, RegistryError, load_registry, require_gate, require_source_root, version_info,
+        versions_for_gate,
+    )
+
 SCHEMA = "hybrid-codex-installer/v3"
 PREVIOUS_STATE_SCHEMA = "hybrid-codex-installer/v2"
 LEGACY_STATE_SCHEMA = "hybrid-codex-installer/v1"
@@ -32,7 +43,6 @@ OLDER_JOURNAL_SCHEMAS = {
 }
 ROOT_IDENTITY_SCHEMA = "hybrid-codex-repository-root/v1"
 PACKAGE_VERSION = "0.2.0-agents-preview"
-SUPPORTED_CODEX_VERSIONS = {"0.155.1", "0.157.1", "0.159.0"}
 INSTALL_DIRECTORY = ".codex-workflow"
 STATE_FILENAME = ".hybrid-codex-workflow-state.json"
 JOURNAL_FILENAME = ".hybrid-codex-workflow-transaction.json"
@@ -103,6 +113,24 @@ def _is_managed_backup_path(relative: str) -> bool:
 
 class WorkflowError(RuntimeError):
     pass
+
+
+def _load_policy(source_root: Path | None = None) -> CompatibilityRegistry:
+    try:
+        return load_registry(source_root if source_root is not None else Path(__file__).absolute().parent.parent)
+    except RegistryError as error:
+        raise WorkflowError(f"Invalid compatibility policy: {error}") from error
+
+
+def _operation_policy(
+    source_root: Path | None = None, policy: CompatibilityRegistry | None = None,
+) -> CompatibilityRegistry:
+    if policy is None:
+        return _load_policy(source_root)
+    try:
+        return require_source_root(policy, source_root if source_root is not None else policy.source_root)
+    except RegistryError as error:
+        raise WorkflowError(f"Invalid compatibility policy: {error}") from error
 
 
 @dataclass
@@ -853,7 +881,11 @@ def _read_state(
     expected_root_identity: dict[str, str] | None = None,
     allow_legacy: bool = False,
     validate_directories: bool = True,
+    *,
+    policy: CompatibilityRegistry | None = None,
+    source_root: Path | None = None,
 ) -> dict[str, Any] | None:
+    registry = _operation_policy(source_root, policy)
     target = expected_target or path.parent
     repository = adapter or _repository_adapter(target)
     relative = repository.normalize(_relative(target, path))
@@ -895,8 +927,10 @@ def _read_state(
         raise WorkflowError(f"Unsupported or malformed state manifest: {path}")
     if value.get("packageVersion") != PACKAGE_VERSION:
         raise WorkflowError(f"Unsupported or malformed state manifest: {path}")
-    if value.get("codexVersion") not in SUPPORTED_CODEX_VERSIONS:
-        raise WorkflowError(f"Unsupported or malformed state manifest: {path}")
+    try:
+        version_info(registry, value.get("codexVersion"))
+    except RegistryError as error:
+        raise WorkflowError(f"Unsupported or malformed state manifest: {path}") from error
     if not _is_timestamp(value.get("installedAt")) or not _is_timestamp(value.get("updatedAt")):
         raise WorkflowError(f"Unsupported or malformed state manifest: {path}")
     if not _is_transaction_id(value.get("transactionId")):
@@ -1099,35 +1133,46 @@ def _detect_codex_version() -> str:
     return match.group(1)
 
 
-def _validate_codex_version() -> str:
-    version = _detect_codex_version()
-    if version not in SUPPORTED_CODEX_VERSIONS:
-        supported = ", ".join(sorted(SUPPORTED_CODEX_VERSIONS))
+def _require_install_version(registry: CompatibilityRegistry, version: str) -> None:
+    try:
+        require_gate(registry, version, "staticInstallation")
+    except RegistryError as error:
+        supported = ", ".join(sorted(versions_for_gate(registry, "staticInstallation")))
         raise WorkflowError(
             f"Unsupported Codex CLI {version}; supported version(s): {supported}. No files were changed."
-        )
+        ) from error
+
+
+def _validate_codex_version(*, policy: CompatibilityRegistry | None = None) -> str:
+    registry = _operation_policy(policy=policy)
+    version = _detect_codex_version()
+    _require_install_version(registry, version)
     return version
 
 
 def _validate_sources(source_root: Path, with_custom_agents: bool = False) -> None:
-    required = list(PACKAGE_FILES) + list(PROJECT_TEMPLATE_FILES)
+    required = list(PACKAGE_FILES) + list(PROJECT_TEMPLATE_FILES) + [COMPATIBILITY_FILE]
     if with_custom_agents:
         required.extend(CUSTOM_AGENT_FILES)
-        required.append(COMPATIBILITY_FILE)
     for relative in required:
         source = source_root / relative
         if not source.is_file() or source.is_symlink():
             raise WorkflowError(f"Required package source is missing or unsafe: {source}")
 
 
-def _validate_custom_agent_sources(source_root: Path, codex_version: str) -> list[str]:
+def _validate_custom_agent_sources(
+    source_root: Path, codex_version: str, *, policy: CompatibilityRegistry | None = None,
+) -> list[str]:
     try:
-        from validate_agent_configs import validate_catalog
+        if __package__:
+            from .validate_agent_configs import validate_catalog
+        else:
+            from validate_agent_configs import validate_catalog
     except ModuleNotFoundError as error:
         raise WorkflowError(
             "Custom agent installation requires Python 3.11 or newer with tomllib support"
         ) from error
-    report = validate_catalog(source_root, codex_version)
+    report = validate_catalog(source_root, codex_version, policy=policy)
     if report.errors:
         raise WorkflowError("Custom agent validation failed:\n" + "\n".join(report.errors))
     return list(report.warnings)
@@ -2077,8 +2122,10 @@ def _rollback_relative_actions(
 
 
 def _recover_with_adapter(
-    adapter: RepositoryAdapter, target: Path, journal_path: Path, dry_run: bool
+    adapter: RepositoryAdapter, target: Path, journal_path: Path, dry_run: bool,
+    *, policy: CompatibilityRegistry | None = None,
 ) -> None:
+    registry = _operation_policy(policy=policy)
     root_identity = _validate_root_identity(adapter.root_identity)
     journal_relative = adapter.normalize(_relative(target, journal_path))
     if not adapter.exists(journal_relative, require_file=True):
@@ -2120,6 +2167,7 @@ def _recover_with_adapter(
                 root_identity,
                 allow_legacy=True,
                 validate_directories=False,
+                policy=registry,
             )
             if previous_state is None:
                 raise WorkflowError("Committed uninstall state backup is unavailable")
@@ -2131,6 +2179,7 @@ def _recover_with_adapter(
                 adapter,
                 root_identity,
                 missing_directories,
+                policy=registry,
             )
         else:
             _cleanup_backup_files(
@@ -2172,10 +2221,12 @@ def recover(
     journal_path: Path,
     dry_run: bool,
     adapter: RepositoryAdapter | None = None,
+    *, policy: CompatibilityRegistry | None = None, source_root: Path | None = None,
 ) -> None:
     repository = adapter or _repository_adapter(target)
     try:
-        _recover_with_adapter(repository, target, journal_path, dry_run)
+        registry = _operation_policy(source_root, policy)
+        _recover_with_adapter(repository, target, journal_path, dry_run, policy=registry)
     finally:
         if adapter is None:
             repository.close()
@@ -2187,11 +2238,15 @@ def _install_with_adapter(
     source_root: Path,
     dry_run: bool,
     with_custom_agents: bool = False,
+    *, policy: CompatibilityRegistry | None = None,
 ) -> str | None:
     _validate_sources(source_root, with_custom_agents)
-    codex_version = _validate_codex_version()
+    registry = _operation_policy(source_root, policy)
+    codex_version = _validate_codex_version(policy=registry)
+    # Preserve fail-closed eligibility even for callers replacing CLI detection.
+    _require_install_version(registry, codex_version)
     validation_warnings = (
-        _validate_custom_agent_sources(source_root, codex_version)
+        _validate_custom_agent_sources(source_root, codex_version, policy=registry)
         if with_custom_agents
         else []
     )
@@ -2202,7 +2257,8 @@ def _install_with_adapter(
             f"{adapter.display(JOURNAL_FILENAME)}"
         )
     old_state = _read_state(
-        adapter.display(STATE_FILENAME), target, adapter, root_identity, allow_legacy=True
+        adapter.display(STATE_FILENAME), target, adapter, root_identity, allow_legacy=True,
+        policy=registry,
     )
     if old_state and old_state.get("target") != str(target):
         raise WorkflowError("State manifest target does not match the requested repository")
@@ -2415,11 +2471,12 @@ def install(
     dry_run: bool,
     with_custom_agents: bool = False,
     adapter: RepositoryAdapter | None = None,
+    *, policy: CompatibilityRegistry | None = None,
 ) -> str | None:
     repository = adapter or _repository_adapter(target)
     try:
         success_message = _install_with_adapter(
-            repository, target, source_root, dry_run, with_custom_agents
+            repository, target, source_root, dry_run, with_custom_agents, policy=policy
         )
     finally:
         if adapter is None:
@@ -2566,7 +2623,9 @@ def _finalize_committed_uninstall(
     adapter: RepositoryAdapter | None = None,
     expected_root_identity: dict[str, str] | None = None,
     missing_directories: set[str] | None = None,
+    *, policy: CompatibilityRegistry | None = None,
 ) -> None:
+    registry = _operation_policy(policy=policy)
     repository = adapter or _repository_adapter(target)
     root_identity = _validate_root_identity(
         expected_root_identity or repository.root_identity
@@ -2578,6 +2637,7 @@ def _finalize_committed_uninstall(
     committed_state = _read_state(
         repository.display(STATE_FILENAME), target, repository, root_identity,
         allow_legacy=False,
+        policy=registry,
     )
     retained_backups = set(committed_state["backups"]) if committed_state is not None else set()
     prerequisites = [
@@ -2619,8 +2679,10 @@ def _finalize_committed_uninstall(
 
 
 def _uninstall_with_adapter(
-    adapter: RepositoryAdapter, target: Path, dry_run: bool
+    adapter: RepositoryAdapter, target: Path, dry_run: bool,
+    *, policy: CompatibilityRegistry | None = None,
 ) -> str | None:
+    registry = _operation_policy(policy=policy)
     root_identity = _validate_root_identity(adapter.root_identity)
     if adapter.exists(JOURNAL_FILENAME, require_file=True):
         raise WorkflowError(
@@ -2628,7 +2690,8 @@ def _uninstall_with_adapter(
             f"{adapter.display(JOURNAL_FILENAME)}"
         )
     state = _read_state(
-        adapter.display(STATE_FILENAME), target, adapter, root_identity, allow_legacy=True
+        adapter.display(STATE_FILENAME), target, adapter, root_identity, allow_legacy=True,
+        policy=registry,
     )
     if state is None:
         print("WARN: no state manifest found; no files were removed")
@@ -2725,7 +2788,8 @@ def _uninstall_with_adapter(
     _assert_current_root_identity(adapter, root_identity, "before transaction mutation")
     _apply_relative_actions(adapter, JOURNAL_FILENAME, transaction_id, "uninstall", actions)
     _finalize_committed_uninstall(
-        target, adapter.display(JOURNAL_FILENAME), actions, state, adapter, root_identity
+        target, adapter.display(JOURNAL_FILENAME), actions, state, adapter, root_identity,
+        policy=registry,
     )
     if remaining_files or remaining_agents:
         print("WARN: uninstall preserved modified managed content; state manifest retained")
@@ -2737,10 +2801,12 @@ def uninstall(
     target: Path,
     dry_run: bool,
     adapter: RepositoryAdapter | None = None,
+    *, policy: CompatibilityRegistry | None = None, source_root: Path | None = None,
 ) -> str | None:
     repository = adapter or _repository_adapter(target)
     try:
-        success_message = _uninstall_with_adapter(repository, target, dry_run)
+        registry = _operation_policy(source_root, policy)
+        success_message = _uninstall_with_adapter(repository, target, dry_run, policy=registry)
     finally:
         if adapter is None:
             repository.close()
@@ -2775,7 +2841,7 @@ def main() -> int:
         if args.recover:
             recover(target, journal_path, args.dry_run, adapter)
         elif args.operation == "install":
-            source_root = Path(__file__).resolve().parent.parent
+            source_root = Path(__file__).absolute().parent.parent
             success_message = install(
                 target,
                 source_root,

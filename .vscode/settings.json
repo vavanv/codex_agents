@@ -6,6 +6,7 @@
     "Lanman",
     "NONALERT",
     "NTSTATUS",
+    "SYSTEMROOT",
     "Soluna",
     "arcfng",
     "bgexjb",
@@ -45,5 +46,17 @@
     "xhigh",
     "ylzcyp",
     "zstfd"
+  ],
+  "cSpell.words": [
+    "cacheprovider",
+    "CREATEPROCESS",
+    "dxyrdchd",
+    "pqwzbw",
+    "preflights",
+    "pytest",
+    "Replayable",
+    "subtests",
+    "unallowlisted",
+    "unrun"
   ]
 }

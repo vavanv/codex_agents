@@ -4,6 +4,9 @@ from datetime import datetime, timedelta, timezone
 import json
 import sys
 import unittest
+import tempfile
+import io
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,6 +15,9 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 
 import validate_composite_fixture as composite
+import codex_compatibility as compatibility
+import codex_event_adapter as adapter
+import reconcile_codex_rollouts as reconciliation
 from tests.verifier.test_reconcile_codex_rollouts import (
     ROLE_FILES,
     encoded,
@@ -68,6 +74,37 @@ def attestation(
 
 
 class CompositeFixtureTests(unittest.TestCase):
+    def test_same_snapshot_and_source_are_forwarded_to_both_evidence_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "compatibility").mkdir()
+            path = root / "compatibility/codex-agents.json"
+            path.write_bytes((REPOSITORY_ROOT / "compatibility/codex-agents.json").read_bytes())
+            registry = compatibility.load_registry(root)
+            values = inputs()
+            path.write_bytes(b"changed snapshot bytes")
+            with patch.object(composite, "load_registry", side_effect=AssertionError("snapshot reload")), \
+                 patch.object(adapter, "load_registry", side_effect=AssertionError("adapter reload")), \
+                 patch.object(reconciliation, "load_registry", side_effect=AssertionError("rollout reload")), \
+                 patch.object(composite, "validate_captured_fixture", wraps=composite.validate_captured_fixture) as public, \
+                 patch.object(composite, "reconcile_rollouts", wraps=composite.reconcile_rollouts) as rollout:
+                result = composite.validate_composite_fixture(*values, source_root=root, policy=registry)
+            self.assertEqual("REVIEW_REQUIRED", result["status"])
+            for nested in (public, rollout):
+                self.assertIs(registry, nested.call_args.kwargs["policy"])
+                self.assertEqual(root, nested.call_args.kwargs["source_root"])
+            with patch.object(composite, "_json_object", side_effect=AssertionError("foreign policy parsed evidence")):
+                with self.assertRaises(compatibility.RegistryError):
+                    composite.validate_composite_fixture(*values, policy=registry)
+
+    def test_cli_invalid_policy_precedes_input_reads(self) -> None:
+        args = ["--capture", "capture", "--manifest", "manifest", "--parent-rollout", "parent",
+                "--child-rollout", "child", "--agent-config", "agent"]
+        with patch.object(composite, "load_registry", side_effect=compatibility.RegistryError("malformed_policy", "bad")), \
+             patch.object(composite, "_read_limited", side_effect=AssertionError("policy failure read evidence")), \
+             redirect_stdout(io.StringIO()):
+            self.assertEqual(2, composite.main(args))
+
     def test_v2_requires_separate_hash_bound_review(self) -> None:
         capture, manifest, parent, child = v2_fixture()
         values = (

@@ -19,6 +19,9 @@ from typing import Any
 from codex_event_adapter import parse_event_stream
 from validate_agent_configs import EXPECTED_ROLES, validate_catalog
 from workflow_manager import CUSTOM_AGENT_FILES, _detect_codex_version
+from codex_compatibility import (
+    CompatibilityRegistry, RegistryError, load_registry, require_gate, require_source_root,
+)
 
 
 EVIDENCE_SCHEMA = "codex-agent-verification/v1"
@@ -26,7 +29,6 @@ EVIDENCE_SCHEMA = "codex-agent-verification/v1"
 # 0.157.1 stream. Synthetic regression fixtures establish fail-closed behavior,
 # not compatibility with a live Codex event schema.
 DISCOVERY_ADAPTER = "codex-cli-jsonl-unvalidated/v1"
-SUPPORTED_RUNTIME_VERSIONS = {"0.155.1", "0.157.1", "0.159.0"}
 REASON_CODES = {
     "ATTRIBUTION_CONFLICT",
     "ATTRIBUTION_BEFORE_PARENT",
@@ -99,10 +101,17 @@ def _sanitize_diagnostic(value: str) -> str:
     return sanitized[-1000:]
 
 
-def verify_installed(target: Path, source_root: Path, codex_version: str) -> list[str]:
+def verify_installed(
+    target: Path, source_root: Path, codex_version: str,
+    *, policy: CompatibilityRegistry | None = None,
+) -> list[str]:
+    registry = policy if policy is not None else load_registry(source_root)
+    require_source_root(registry, source_root)
     errors: list[str] = []
-    report = validate_catalog(source_root, codex_version)
+    report = validate_catalog(source_root, codex_version, policy=registry)
     errors.extend(report.errors)
+    if errors:
+        return errors
     for source_relative, installed_relative in CUSTOM_AGENT_FILES.items():
         source_path = source_root / source_relative
         installed_path = target / installed_relative
@@ -252,7 +261,7 @@ def _write_evidence(path: Path, value: dict[str, Any]) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", type=Path, required=True)
-    parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument("--source-root", type=Path, default=Path(__file__).absolute().parent.parent)
     parser.add_argument("--run-codex", action="store_true")
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--evidence", type=Path)
@@ -268,7 +277,7 @@ def _print_outcome(status: str, reason_codes: list[str], discovery: str) -> None
 def main() -> int:
     args = _parser().parse_args()
     target = args.target.resolve()
-    source_root = args.source_root.resolve()
+    source_root = args.source_root.absolute()
     codex_version: str | None = None
     parsed: ParsedDiscovery | None = None
     scope = "runtime-discovery" if args.run_codex else "installed-only"
@@ -278,8 +287,10 @@ def main() -> int:
     discovery = "UNVERIFIED"
     reason_codes: list[str] = []
     try:
+        registry = load_registry(source_root)
+        require_source_root(registry, source_root)
         codex_version = _detect_codex_version()
-        errors = verify_installed(target, source_root, codex_version)
+        errors = verify_installed(target, source_root, codex_version, policy=registry)
         if errors:
             reason_codes = ["INSTALLATION_INVALID"]
         else:
@@ -288,20 +299,25 @@ def main() -> int:
                 status = "PASS"
                 exit_code = 0
                 reason_codes = ["STATIC_VERIFIED", "DISCOVERY_NOT_REQUESTED"]
-            elif codex_version not in SUPPORTED_RUNTIME_VERSIONS:
-                reason_codes = ["UNSUPPORTED_RUNTIME_VERSION"]
             else:
-                process_result = run_discovery(target, args.timeout)
-                status, exit_code, reason_codes = _classify_process(process_result)
-                if status == "PASS":
-                    parsed = parse_discovery(process_result.stdout)
-                    status = "UNVERIFIED"
-                    exit_code = 3
-                    reason_codes = sorted(
-                        set(parsed.reason_codes) | {"UNVALIDATED_EVENT_ADAPTER"}
-                    )
-                elif status == "BLOCKED":
-                    discovery = "BLOCKED"
+                try:
+                    require_gate(registry, codex_version, "discoveryDiagnostic")
+                except RegistryError as error:
+                    if error.category not in {"unknown_version", "denied_gate"}:
+                        raise
+                    reason_codes = ["UNSUPPORTED_RUNTIME_VERSION"]
+                else:
+                    process_result = run_discovery(target, args.timeout)
+                    status, exit_code, reason_codes = _classify_process(process_result)
+                    if status == "PASS":
+                        parsed = parse_discovery(process_result.stdout)
+                        status = "UNVERIFIED"
+                        exit_code = 3
+                        reason_codes = sorted(
+                            set(parsed.reason_codes) | {"UNVALIDATED_EVENT_ADAPTER"}
+                        )
+                    elif status == "BLOCKED":
+                        discovery = "BLOCKED"
     except Exception:
         status = "FAIL"
         exit_code = 1

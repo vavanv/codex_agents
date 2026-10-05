@@ -10,16 +10,22 @@ import re
 from capture_live_event import ROLE_NAMES, _owned_run_lock
 from live_validation_support import MARKER_NAME, LiveValidationError, validate_marker
 from validate_capture_snapshot import _read_json, validate_snapshot_sidecar
+from codex_compatibility import CompatibilityRegistry, RegistryError, load_registry, require_gate, require_source_root
 
 
 SCHEMA = "codex-l5-snapshot-matrix/v1"
 CAPTURE_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 MAX_INDEX_BYTES = 65_536
-SUPPORTED_VERSIONS = {"0.155.1", "0.157.1", "0.159.0"}
 
 
-def validate_l5_snapshot_matrix(run_root: Path, index_path: Path) -> dict[str, object]:
+def validate_l5_snapshot_matrix(
+    run_root: Path, index_path: Path, *, source_root: Path | None = None,
+    policy: CompatibilityRegistry | None = None,
+) -> dict[str, object]:
     """Check only matrix shape, identities, and nine valid state brackets."""
+    trusted_root = source_root if source_root is not None else Path(__file__).absolute().parent.parent
+    registry = policy if policy is not None else load_registry(trusted_root)
+    require_source_root(registry, trusted_root)
     marker_before_validation = (run_root / MARKER_NAME).read_bytes()
     root, marker = validate_marker(run_root)
     if marker["lifecycle"] != "ready" or marker["activeWorkers"]:
@@ -33,7 +39,8 @@ def validate_l5_snapshot_matrix(run_root: Path, index_path: Path) -> dict[str, o
         if locked_marker["lifecycle"] != "ready" or locked_marker["activeWorkers"]:
             raise ValueError("Owned fixture is not ready under validation lock")
         return _validate_locked_matrix(
-            root, locked_marker, marker_before_validation, index_path
+            root, locked_marker, marker_before_validation, index_path,
+            source_root=trusted_root, policy=registry,
         )
 
 
@@ -42,6 +49,7 @@ def _validate_locked_matrix(
     marker: dict[str, object],
     marker_bytes: bytes,
     index_path: Path,
+    *, source_root: Path, policy: CompatibilityRegistry,
 ) -> dict[str, object]:
     if (
         index_path.is_symlink()
@@ -60,8 +68,12 @@ def _validate_locked_matrix(
     if index["runId"] != marker["runId"]:
         raise ValueError("Matrix index run identity does not match")
     expected_version = index["codexVersion"]
-    if not isinstance(expected_version, str) or expected_version not in SUPPORTED_VERSIONS:
-        raise ValueError("Matrix Codex version is invalid")
+    try:
+        require_gate(policy, expected_version, "capturedEvidence")
+    except RegistryError as error:
+        if error.category not in {"unknown_version", "denied_gate"}:
+            raise
+        raise ValueError("Matrix Codex version is invalid") from error
     entries = index["entries"]
     if not isinstance(entries, list) or len(entries) != len(ROLE_NAMES):
         raise ValueError("Matrix must have exactly nine entries")
@@ -85,7 +97,7 @@ def _validate_locked_matrix(
         expected = f"results/capture-{role}-{capture_id}.snapshot-evidence.json"
         if not isinstance(sidecar, str) or sidecar != expected or sidecar in seen_sidecars:
             raise ValueError("Matrix sidecar path is invalid or repeated")
-        result = validate_snapshot_sidecar(root, root / sidecar)
+        result = validate_snapshot_sidecar(root, root / sidecar, source_root=source_root, policy=policy)
         if (
             result.get("status") != "SNAPSHOT_BRACKET_VALID"
             or result.get("runId") != marker["runId"]
@@ -127,7 +139,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--index", type=Path, required=True)
     arguments = parser.parse_args(argv)
     try:
-        output = validate_l5_snapshot_matrix(arguments.run_root, arguments.index)
+        source_root = Path(__file__).absolute().parent.parent
+        registry = load_registry(source_root)
+        require_source_root(registry, source_root)
+        output = validate_l5_snapshot_matrix(arguments.run_root, arguments.index,
+                                             source_root=source_root, policy=registry)
         print(json.dumps(output, sort_keys=True))
         return 0
     except (OSError, ValueError, UnicodeError, json.JSONDecodeError, LiveValidationError):

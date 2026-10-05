@@ -47,7 +47,7 @@ class WorkflowManagerTests(unittest.TestCase):
         state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     def copy_install_sources(self, destination: Path) -> None:
-        for relative in list(manager.PACKAGE_FILES) + list(manager.PROJECT_TEMPLATE_FILES):
+        for relative in list(manager.PACKAGE_FILES) + list(manager.PROJECT_TEMPLATE_FILES) + [manager.COMPATIBILITY_FILE]:
             source = REPOSITORY_ROOT / relative
             copied = destination / relative
             copied.parent.mkdir(parents=True, exist_ok=True)
@@ -172,6 +172,27 @@ class WorkflowManagerTests(unittest.TestCase):
     def test_supported_version_0_159_0_is_accepted(self) -> None:
         with patch.object(manager, "_detect_codex_version", return_value="0.159.0"):
             self.assertEqual("0.159.0", manager._validate_codex_version())
+
+    def test_supported_version_0_159_3_is_accepted(self) -> None:
+        with patch.object(manager, "_detect_codex_version", return_value="0.159.3"):
+            self.assertEqual("0.159.3", manager._validate_codex_version())
+
+    def test_static_candidate_0_160_0_dry_run_is_accepted_without_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            with patch.object(manager, "_detect_codex_version", return_value="0.160.0"), redirect_stdout(StringIO()):
+                self.assertEqual("0.160.0", manager._validate_codex_version())
+                manager.install(target, REPOSITORY_ROOT, dry_run=True, with_custom_agents=True)
+            self.assertEqual([], list(target.iterdir()))
+
+    def test_unknown_or_malformed_candidate_versions_cannot_write(self) -> None:
+        for version in ("0.160.1", "0.160", "0.160.0-beta", " 0.160.0", "codex-cli 0.160.0", ""):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                target = Path(directory)
+                with patch.object(manager, "_detect_codex_version", return_value=version):
+                    with self.assertRaisesRegex(manager.WorkflowError, "Unsupported Codex CLI"):
+                        manager.install(target, REPOSITORY_ROOT, dry_run=False, with_custom_agents=True)
+                self.assertEqual([], list(target.iterdir()))
 
     def test_state_path_cannot_escape_target(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

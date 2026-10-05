@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+from io import StringIO
+from contextlib import redirect_stdout
+from types import SimpleNamespace
 import subprocess
 import sys
 import tempfile
@@ -14,6 +18,7 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 
 import capture_live_event as capture_module
 import codex_event_adapter as adapter
+from codex_compatibility import RegistryError, load_registry
 
 
 PARENT = "00000000-0000-4000-8000-000000000001"
@@ -29,6 +34,117 @@ class CaptureLiveEventTests(unittest.TestCase):
         results.mkdir()
         sqlite_home.mkdir()
         return fixture, results, sqlite_home
+
+
+    def policy_source(self, root: Path, *, version: str = "0.159.3") -> Path:
+        source = root / "source"
+        (source / "compatibility").mkdir(parents=True)
+        document = json.loads((REPOSITORY_ROOT / "compatibility/codex-agents.json").read_text(encoding="utf-8"))
+        document["runProfiles"]["legacy-windows-capture"]["expectedVersion"] = version
+        (source / "compatibility/codex-agents.json").write_text(json.dumps(document), encoding="utf-8")
+        return source
+
+    def test_invalid_policy_blocks_before_paths_probe_or_persistence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.policy_source(root)
+            (source / "compatibility/codex-agents.json").write_text("{}", encoding="utf-8")
+            with patch.object(capture_module, "_paths") as paths, patch.object(capture_module, "_version") as probe, patch.object(capture_module, "_persist_capture") as persist:
+                with self.assertRaises(RegistryError):
+                    capture_module.capture(root, root, 30, "codex", ("code_explorer",), False, None, source_root=source)
+            paths.assert_not_called()
+            probe.assert_not_called()
+            persist.assert_not_called()
+
+    def test_injected_foreign_policy_never_selects_its_own_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.policy_source(root)
+            policy = load_registry(source)
+            with patch.object(capture_module, "_paths") as paths:
+                with self.assertRaises(RegistryError):
+                    capture_module.capture(root, root, 30, "codex", ("code_explorer",), False, None, policy=policy)
+            paths.assert_not_called()
+
+    def test_changed_profile_rejects_old_cli_before_exec_and_keeps_outputs_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.policy_source(root, version="0.157.1")
+            fixture, results, _ = self.directories(root)
+            with patch.object(capture_module, "_resolve_codex_command", return_value=("fake",)), patch.object(capture_module, "_version", return_value=(0, "codex-cli 0.159.3")), patch.object(capture_module.subprocess, "run") as run:
+                code, output = capture_module.capture(fixture, results, 30, "fake", ("code_explorer",), False, None, source_root=source)
+            self.assertEqual(2, code)
+            self.assertEqual("PINNED_VERSION_UNAVAILABLE", output["reason"])
+            run.assert_not_called()
+            self.assertEqual([], list(results.iterdir()))
+
+    def test_snapshot_is_reused_after_registry_bytes_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.policy_source(root)
+            policy = load_registry(source)
+            fixture, results, _ = self.directories(root)
+            (source / "compatibility/codex-agents.json").write_text("{}", encoding="utf-8")
+            completed = subprocess.CompletedProcess([], 0, "", "")
+            with patch.object(capture_module, "load_registry", side_effect=AssertionError("unexpected reload")), patch.object(capture_module, "_resolve_codex_command", return_value=("fake",)), patch.object(capture_module, "_version", return_value=(0, "codex-cli 0.159.3")), patch.object(capture_module.subprocess, "run", return_value=completed):
+                code, _ = capture_module.capture(fixture, results, 30, "fake", ("code_explorer",), False, None, source_root=source, policy=policy)
+            self.assertEqual(0, code)
+            manifest = json.loads((results / "real-capture.manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual("0.159.3", manifest["codexVersion"])
+            self.assertEqual("windows-0.159.3-code_explorer-capture", manifest["name"])
+
+    def test_missing_policy_blocks_owned_capture_before_marker_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaises(RegistryError):
+                capture_module.capture_owned_run(root / "absent-run", 30, "fake", "code_explorer", source_root=root)
+
+    def test_preferred_install_target_and_cwd_do_not_select_experiment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.policy_source(root)
+            path = source / "compatibility/codex-agents.json"
+            document = json.loads(path.read_text(encoding="utf-8"))
+            document["preferredInstallTarget"] = "0.155.1"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                identity = capture_module._legacy_identity(source)
+                shipped = capture_module._legacy_identity()
+            finally:
+                os.chdir(previous)
+            self.assertEqual("0.159.3", identity.profile.expected_version)
+            self.assertEqual("codex-cli 0.159.3", shipped.profile.cli_banner)
+
+
+    def test_reparse_source_is_rejected_before_paths_probe_and_cli_envelope_is_blocked(self) -> None:
+        original_lstat = Path.lstat
+        def reparse(path: Path, *args, **kwargs):
+            metadata = original_lstat(path, *args, **kwargs)
+            if path == REPOSITORY_ROOT / "compatibility/codex-agents.json":
+                return SimpleNamespace(st_mode=metadata.st_mode, st_file_attributes=0x400)
+            return metadata
+        with patch.object(Path, "lstat", reparse), patch.object(capture_module, "_paths") as paths, patch.object(capture_module, "_version") as probe:
+            with self.assertRaises(RegistryError):
+                capture_module.capture(Path("unused"), Path("unused"), 30, "fake", ("code_explorer",), False, None)
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                code = capture_module.main(["--owned-run-root", "absent", "--role", "code_explorer"])
+        paths.assert_not_called()
+        probe.assert_not_called()
+        self.assertEqual(4, code)
+        self.assertEqual({"status": "BLOCKED", "reason": "OWNED_CAPTURE_FAILED"}, json.loads(stdout.getvalue()))
+
+    def test_identity_modules_import_without_reading_policy_or_invoking_cli(self) -> None:
+        import codex_compatibility
+        paths = ("capture_live_event.py", "prepare_live_preflight.py", "validate_l5_private_matrix.py", "run_live_behavior_case.py")
+        sources = {name: (REPOSITORY_ROOT / "scripts" / name).read_text(encoding="utf-8") for name in paths}
+        with patch.object(codex_compatibility, "load_registry", side_effect=AssertionError("import read policy")) as load, patch.object(subprocess, "run", side_effect=AssertionError("import invoked CLI")) as invoke:
+            for name, source in sources.items():
+                exec(compile(source, name, "exec"), {"__name__": "capture_live_event", "__file__": str(REPOSITORY_ROOT / "scripts" / name)})
+        load.assert_not_called()
+        invoke.assert_not_called()
 
     def test_windows_default_resolves_to_cmd_shim(self) -> None:
         def resolve(candidate: str) -> str | None:
@@ -170,7 +286,7 @@ class CaptureLiveEventTests(unittest.TestCase):
             with patch.object(
                 capture_module,
                 "_version",
-                return_value=(0, capture_module.PINNED_CODEX_VERSION),
+                return_value=(0, "codex-cli 0.159.3"),
             ), patch.object(
                 capture_module,
                 "_resolve_codex_command",
@@ -206,8 +322,8 @@ class CaptureLiveEventTests(unittest.TestCase):
             manifest = json.loads(
                 (results / "real-capture.manifest.json").read_text(encoding="utf-8")
             )
-            self.assertEqual("0.159.0", manifest["codexVersion"])
-            self.assertEqual("windows-0.159.0-code_explorer-capture", manifest["name"])
+            self.assertEqual("0.159.3", manifest["codexVersion"])
+            self.assertEqual("windows-0.159.3-code_explorer-capture", manifest["name"])
             self.assertEqual(["code_explorer"], manifest["requestedRoles"])
             self.assertFalse(manifest["timedOut"])
             self.assertNotIn("--ephemeral", manifest["command"])
@@ -221,7 +337,7 @@ class CaptureLiveEventTests(unittest.TestCase):
             with patch.object(
                 capture_module,
                 "_version",
-                return_value=(0, capture_module.PINNED_CODEX_VERSION),
+                return_value=(0, "codex-cli 0.159.3"),
             ), patch.object(
                 capture_module,
                 "_resolve_codex_command",
@@ -272,7 +388,7 @@ class CaptureLiveEventTests(unittest.TestCase):
             with patch.object(
                 capture_module,
                 "_version",
-                return_value=(0, capture_module.PINNED_CODEX_VERSION),
+                return_value=(0, "codex-cli 0.159.3"),
             ), patch.object(
                 capture_module,
                 "_resolve_codex_command",
@@ -326,7 +442,7 @@ class CaptureLiveEventTests(unittest.TestCase):
             with patch.object(
                 capture_module,
                 "_version",
-                return_value=(0, capture_module.PINNED_CODEX_VERSION),
+                return_value=(0, "codex-cli 0.159.3"),
             ), patch.object(
                 capture_module,
                 "_resolve_codex_command",
@@ -391,7 +507,7 @@ class CaptureLiveEventTests(unittest.TestCase):
             with patch.object(
                 capture_module,
                 "_version",
-                return_value=(0, capture_module.PINNED_CODEX_VERSION),
+                return_value=(0, "codex-cli 0.159.3"),
             ), patch.object(
                 capture_module,
                 "_resolve_codex_command",

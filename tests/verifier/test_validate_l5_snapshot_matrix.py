@@ -4,6 +4,7 @@ from contextlib import contextmanager, redirect_stdout
 import copy
 from io import StringIO
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -18,6 +19,8 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 import capture_live_event as capture_module
 import live_validation_support as live
 import validate_l5_snapshot_matrix as matrix_validator
+import validate_capture_snapshot as snapshot_validator
+import codex_compatibility as compatibility
 
 
 class L5SnapshotMatrixTests(unittest.TestCase):
@@ -86,7 +89,7 @@ class L5SnapshotMatrixTests(unittest.TestCase):
         self.value: dict[str, object] = {
             "schema": matrix_validator.SCHEMA,
             "runId": self.marker["runId"],
-            "codexVersion": "0.159.0",
+            "codexVersion": "0.159.3",
             "entries": copy.deepcopy(self.entries),
         }
         self.write_index()
@@ -103,7 +106,7 @@ class L5SnapshotMatrixTests(unittest.TestCase):
         self.assertEqual({
             "status": "SNAPSHOT_MATRIX_COMPLETE",
             "roleCount": 9,
-            "codexVersion": "0.159.0",
+            "codexVersion": "0.159.3",
             "l5Accepted": False,
             "runtimeValidated": False,
         }, matrix_validator.validate_l5_snapshot_matrix(self.root, self.index_path))
@@ -203,8 +206,8 @@ class L5SnapshotMatrixTests(unittest.TestCase):
     def test_changed_child_validation_identity_rejected(self) -> None:
         original_validator = matrix_validator.validate_snapshot_sidecar
 
-        def wrong_identity(root: Path, sidecar: Path) -> dict[str, object]:
-            result = original_validator(root, sidecar)
+        def wrong_identity(root: Path, sidecar: Path, **kwargs: object) -> dict[str, object]:
+            result = original_validator(root, sidecar, **kwargs)
             if result["role"] == self.entries[0]["role"]:
                 return {**result, "captureId": self.entries[1]["captureId"]}
             return result
@@ -262,8 +265,8 @@ class L5SnapshotMatrixTests(unittest.TestCase):
         original = sidecar.read_bytes()
         original_validator = matrix_validator.validate_snapshot_sidecar
 
-        def mutate_after_validation(root: Path, path: Path) -> dict[str, object]:
-            result = original_validator(root, path)
+        def mutate_after_validation(root: Path, path: Path, **kwargs: object) -> dict[str, object]:
+            result = original_validator(root, path, **kwargs)
             if path == sidecar:
                 sidecar.write_bytes(original + b"\n")
             return result
@@ -288,8 +291,8 @@ class L5SnapshotMatrixTests(unittest.TestCase):
         for target in ("index", "marker"):
             self.write_index()
 
-            def mutate_after_validation(root: Path, path: Path) -> dict[str, object]:
-                result = original_validator(root, path)
+            def mutate_after_validation(root: Path, path: Path, **kwargs: object) -> dict[str, object]:
+                result = original_validator(root, path, **kwargs)
                 if path == last_sidecar:
                     if target == "index":
                         self.index_path.write_bytes(self.index_path.read_bytes() + b" ")
@@ -326,6 +329,63 @@ class L5SnapshotMatrixTests(unittest.TestCase):
             "runtimeValidated": False,
         }, json.loads(output.getvalue()))
         self.assertNotIn(str(self.root), output.getvalue())
+
+
+    def test_same_policy_snapshot_reaches_all_nine_sidecars_from_unrelated_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            (source / "compatibility").mkdir()
+            path = source / "compatibility/codex-agents.json"
+            path.write_bytes((REPOSITORY_ROOT / "compatibility/codex-agents.json").read_bytes())
+            registry = compatibility.load_registry(source)
+            path.write_bytes(b"changed snapshot bytes")
+            prior = Path.cwd()
+            os.chdir(directory)
+            try:
+                with patch.object(matrix_validator, "load_registry", side_effect=AssertionError("matrix snapshot reload")), \
+                     patch.object(snapshot_validator, "load_registry", side_effect=AssertionError("sidecar snapshot reload")), \
+                     patch.object(matrix_validator, "validate_snapshot_sidecar", wraps=matrix_validator.validate_snapshot_sidecar) as nested:
+                    result = matrix_validator.validate_l5_snapshot_matrix(self.root, self.index_path, source_root=source, policy=registry)
+            finally:
+                os.chdir(prior)
+            self.assertEqual("SNAPSHOT_MATRIX_COMPLETE", result["status"])
+            self.assertEqual(9, nested.call_count)
+            for call in nested.call_args_list:
+                self.assertIs(registry, call.kwargs["policy"])
+                self.assertEqual(source, call.kwargs["source_root"])
+            with patch.object(Path, "read_bytes", side_effect=AssertionError("foreign policy read marker")):
+                with self.assertRaises(compatibility.RegistryError):
+                    matrix_validator.validate_l5_snapshot_matrix(self.root, self.index_path, policy=registry)
+            path.unlink()
+            with patch.object(Path, "read_bytes", side_effect=AssertionError("missing policy read marker")):
+                with self.assertRaises(compatibility.RegistryError):
+                    matrix_validator.validate_l5_snapshot_matrix(self.root, self.index_path, source_root=source)
+
+    def test_registered_but_denied_index_version_fails_before_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            (source / "compatibility").mkdir()
+            document = json.loads((REPOSITORY_ROOT / "compatibility/codex-agents.json").read_bytes())
+            document["versions"]["0.155.1"]["gates"]["capturedEvidence"] = False
+            document["versions"]["0.155.1"]["rolloutSchemas"] = []
+            (source / "compatibility/codex-agents.json").write_text(json.dumps(document), encoding="utf-8")
+            self.value["codexVersion"] = "0.155.1"
+            self.write_index()
+            with patch.object(matrix_validator, "validate_snapshot_sidecar", side_effect=AssertionError("denied matrix reached sidecar")):
+                with self.assertRaisesRegex(ValueError, "Matrix Codex version is invalid"):
+                    matrix_validator.validate_l5_snapshot_matrix(self.root, self.index_path, source_root=source)
+
+    def test_static_candidate_and_cli_corruption_preserve_invalid_matrix_envelope(self) -> None:
+        self.value["codexVersion"] = "0.160.0"
+        self.write_index()
+        with patch.object(matrix_validator, "validate_snapshot_sidecar", side_effect=AssertionError("static candidate reached sidecar")):
+            with self.assertRaisesRegex(ValueError, "Matrix Codex version is invalid"):
+                matrix_validator.validate_l5_snapshot_matrix(self.root, self.index_path)
+        with patch.object(matrix_validator, "load_registry", side_effect=compatibility.RegistryError("malformed_policy", "bad")), \
+             patch.object(matrix_validator, "validate_l5_snapshot_matrix", side_effect=AssertionError("CLI read fixture")), \
+             redirect_stdout(StringIO()) as output:
+            self.assertEqual(2, matrix_validator.main(["--run-root", str(self.root), "--index", str(self.index_path)]))
+        self.assertEqual("SNAPSHOT_MATRIX_INVALID", json.loads(output.getvalue())["status"])
 
 
 if __name__ == "__main__":

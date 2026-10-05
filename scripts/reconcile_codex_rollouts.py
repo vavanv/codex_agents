@@ -16,6 +16,7 @@ from typing import Any
 from uuid import UUID
 
 from codex_event_adapter import parse_event_stream, sanitize_event_stream
+from codex_compatibility import CompatibilityRegistry, RegistryError, load_registry, require_rollout_schema, require_source_root
 
 
 EVIDENCE_SCHEMA = "codex-rollout-evidence/v1"
@@ -23,7 +24,6 @@ V2_EVIDENCE_SCHEMA = "codex-rollout-evidence/v2"
 V2_MAX_JSON_DEPTH = 32
 V2_MAX_ROWS = 20_000
 MAX_INPUT_BYTES = 16 * 1024 * 1024
-SUPPORTED_VERSIONS = {"0.155.1", "0.157.1", "0.159.0"}
 PINNED_ROLE = "code_explorer"
 PINNED_AGENT_CONFIG_HASH = (
     "c15bf506a5d1efac9227ad94a3981605df54bce84444f286d18280229998e579"
@@ -191,8 +191,13 @@ def reconcile_rollouts(
     *,
     role: str,
     rollout_variant: str = "v1",
+    source_root: Path | None = None,
+    policy: CompatibilityRegistry | None = None,
 ) -> dict[str, Any]:
     """Return only allowlisted evidence fields; any mismatch is non-correlated."""
+    root = source_root if source_root is not None else Path(__file__).absolute().parent.parent
+    registry = policy if policy is not None else load_registry(root)
+    require_source_root(registry, root)
     reasons: set[str] = set()
     evidence_schema = V2_EVIDENCE_SCHEMA if rollout_variant == "v2" else EVIDENCE_SCHEMA
     base: dict[str, Any] = {
@@ -229,11 +234,17 @@ def reconcile_rollouts(
         return base
 
     capture_version = manifest.get("codexVersion")
+    version_eligible = True
+    try:
+        require_rollout_schema(registry, capture_version, rollout_variant)
+    except RegistryError as error:
+        if error.category not in {"unknown_version", "denied_gate", "unsupported_rollout"}:
+            raise
+        version_eligible = False
     if (
         manifest.get("schema") != "codex-live-fixture-manifest/v1"
         or manifest.get("eventSchema") != "codex-cli-jsonl/v1"
-        or capture_version not in SUPPORTED_VERSIONS
-        or (rollout_variant == "v2" and capture_version not in {"0.157.1", "0.159.0"})
+        or not version_eligible
         or manifest.get("requestedRoles") != [role]
         or manifest.get("sanitized") is not True
         or manifest.get("reviewed") is not False
@@ -591,6 +602,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rollout-variant", choices=("v1", "v2"), default="v1")
     args = parser.parse_args(argv)
     try:
+        source_root = Path(__file__).absolute().parent.parent
+        registry = load_registry(source_root)
+        require_source_root(registry, source_root)
         manifest = json.loads(
             _read_limited(args.manifest),
             object_pairs_hook=_reject_duplicate_keys if args.rollout_variant == "v2" else dict,
@@ -606,6 +620,7 @@ def main(argv: list[str] | None = None) -> int:
             _read_limited(args.child_rollout),
             _read_limited(args.agent_config),
             role=args.role, rollout_variant=args.rollout_variant,
+            source_root=source_root, policy=registry,
         )
     except (OSError, ValueError, UnicodeDecodeError, RecursionError):
         result = {

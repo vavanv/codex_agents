@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -12,6 +13,10 @@ import shutil
 import subprocess
 import sys
 import uuid
+
+from codex_compatibility import (
+    CompatibilityRegistry, RunProfile, load_registry, require_source_root, run_profile,
+)
 
 from live_validation_support import (
     MARKER_NAME,
@@ -32,7 +37,6 @@ from codex_event_adapter import (
 )
 
 
-PINNED_CODEX_VERSION = "codex-cli 0.159.0"
 ROLE_NAMES = (
     "code_explorer",
     "quick_implementer",
@@ -44,6 +48,25 @@ ROLE_NAMES = (
     "code_reviewer",
     "commit_pusher",
 )
+
+
+@dataclass(frozen=True)
+class LegacyRunIdentity:
+    """The bound policy and fixed experiment identity for one operation."""
+
+    policy: CompatibilityRegistry
+    source_root: Path
+    profile: RunProfile
+
+
+def _legacy_identity(
+    source_root: Path | None = None,
+    policy: CompatibilityRegistry | None = None,
+) -> LegacyRunIdentity:
+    source = Path(__file__).absolute().parent.parent if source_root is None else source_root
+    snapshot = load_registry(source) if policy is None else policy
+    require_source_root(snapshot, source)
+    return LegacyRunIdentity(snapshot, source, run_profile(snapshot, "legacy-windows-capture"))
 
 
 def _prompt(roles: tuple[str, ...]) -> str:
@@ -182,9 +205,15 @@ def _persist_capture(
     isolate_user_config: bool,
     trust_fixture: bool,
     output_prefix: str = "real-capture",
+    *,
+    source_root: Path | None = None,
+    policy: CompatibilityRegistry | None = None,
+    _identity: LegacyRunIdentity | None = None,
 ) -> tuple[dict[str, object], object]:
-    capture_name = "windows-0.159.0-" + "-".join(roles) + "-capture"
-    manifest = capture_fixture_manifest(capture_name, "0.159.0", stdout)
+    identity = _identity or _legacy_identity(source_root, policy)
+    version = identity.profile.expected_version
+    capture_name = f"windows-{version}-" + "-".join(roles) + "-capture"
+    manifest = capture_fixture_manifest(capture_name, version, stdout)
     manifest.update(
         {
             "reviewed": False,
@@ -222,7 +251,11 @@ def capture(
     isolate_user_config: bool = False,
     trust_fixture: bool = False,
     output_prefix: str = "real-capture",
+    source_root: Path | None = None,
+    policy: CompatibilityRegistry | None = None,
+    _identity: LegacyRunIdentity | None = None,
 ) -> tuple[int, dict[str, object]]:
+    identity = _identity or _legacy_identity(source_root, policy)
     if trust_fixture and not isolate_user_config:
         raise ValueError("Fixture trust override requires isolated user configuration")
     fixture_root, results_root = _paths(fixture, results)
@@ -230,7 +263,7 @@ def capture(
     version_exit, version_text = _version(
         resolved_codex_command, fixture_root, timeout
     )
-    if version_exit != 0 or version_text != PINNED_CODEX_VERSION:
+    if version_exit != 0 or version_text != identity.profile.cli_banner:
         return 2, {
             "status": "BLOCKED",
             "reason": "PINNED_VERSION_UNAVAILABLE",
@@ -288,6 +321,7 @@ def capture(
             isolate_user_config,
             trust_fixture,
             output_prefix,
+            _identity=identity,
         )
         return 3, {
             "status": "BLOCKED",
@@ -311,6 +345,7 @@ def capture(
         isolate_user_config,
         trust_fixture,
         output_prefix,
+        _identity=identity,
     )
     return result.returncode, {
         "status": "CAPTURED",
@@ -396,8 +431,11 @@ def capture_owned_run(
     *,
     isolate_user_config: bool = True,
     trust_fixture: bool = True,
+    source_root: Path | None = None,
+    policy: CompatibilityRegistry | None = None,
 ) -> tuple[int, dict[str, object]]:
     """Capture one role inside a canonical owned fixture with state bracketing."""
+    identity = _legacy_identity(source_root, policy)
     if role not in ROLE_NAMES:
         raise ValueError("Owned capture role is invalid")
     marker_before_validation = (run_root / MARKER_NAME).read_bytes()
@@ -420,6 +458,7 @@ def capture_owned_run(
             role,
             isolate_user_config=isolate_user_config,
             trust_fixture=trust_fixture,
+            _identity=identity,
         )
 
 
@@ -432,6 +471,7 @@ def _capture_owned_locked(
     *,
     isolate_user_config: bool,
     trust_fixture: bool,
+    _identity: LegacyRunIdentity,
 ) -> tuple[int, dict[str, object]]:
     results = root / "results"
     capture_id = uuid.uuid4().hex
@@ -468,6 +508,7 @@ def _capture_owned_locked(
                 isolate_user_config=isolate_user_config,
                 trust_fixture=trust_fixture,
                 output_prefix=prefix,
+                _identity=_identity,
             )
         except BaseException as error:
             capture_failure = error

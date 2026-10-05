@@ -22,6 +22,7 @@ from reconcile_codex_rollouts import MAX_INPUT_BYTES
 from validate_capture_snapshot import _utc, validate_snapshot_sidecar
 from validate_composite_fixture import validate_composite_fixture
 from validate_l5_snapshot_matrix import CAPTURE_ID_PATTERN
+from codex_compatibility import CompatibilityRegistry, RegistryError, load_registry, require_gate, require_rollout_schema, require_source_root
 
 
 SCHEMA = "codex-l5-rollout-matrix/v1"
@@ -190,8 +191,12 @@ def _validate_link_review(
 
 
 def validate_l5_rollout_matrix(
-    run_root: Path, index_path: Path, evidence_root: Path
+    run_root: Path, index_path: Path, evidence_root: Path,
+    *, source_root: Path | None = None, policy: CompatibilityRegistry | None = None,
 ) -> dict[str, object]:
+    trusted_root = source_root if source_root is not None else Path(__file__).absolute().parent.parent
+    registry = policy if policy is not None else load_registry(trusted_root)
+    require_source_root(registry, trusted_root)
     marker_bytes = _safe_file(run_root / MARKER_NAME, MAX_INPUT_BYTES)
     root, marker = validate_marker(run_root)
     if marker["lifecycle"] != "ready" or marker["activeWorkers"]:
@@ -204,7 +209,8 @@ def validate_l5_rollout_matrix(
         _, locked_marker = validate_marker(root)
         if locked_marker["lifecycle"] != "ready" or locked_marker["activeWorkers"]:
             raise ValueError("Owned fixture is not ready under lock")
-        return _validate_locked(root, locked_marker, marker_bytes, index_path, evidence_root)
+        return _validate_locked(root, locked_marker, marker_bytes, index_path, evidence_root,
+                                source_root=trusted_root, policy=registry)
 
 
 def _validate_locked(
@@ -213,6 +219,7 @@ def _validate_locked(
     marker_bytes: bytes,
     index_path: Path,
     evidence_root: Path,
+    *, source_root: Path, policy: CompatibilityRegistry,
 ) -> dict[str, object]:
     if not evidence_root.is_dir() or evidence_root.resolve() == root:
         raise ValueError("External evidence root is invalid")
@@ -231,10 +238,20 @@ def _validate_locked(
     if index["runId"] != marker["runId"]:
         raise ValueError("Matrix run identity does not match")
     expected_version = index["codexVersion"]
-    if not isinstance(expected_version, str) or expected_version not in {"0.155.1", "0.157.1", "0.159.0"}:
-        raise ValueError("Matrix Codex version is invalid")
-    if matrix_variant == "v2" and expected_version not in {"0.157.1", "0.159.0"}:
-        raise ValueError("V2 matrix requires Codex 0.157.1")
+    try:
+        require_gate(policy, expected_version, "capturedEvidence")
+    except RegistryError as error:
+        if error.category not in {"unknown_version", "denied_gate"}:
+            raise
+        raise ValueError("Matrix Codex version is invalid") from error
+    try:
+        require_rollout_schema(policy, expected_version, matrix_variant)
+    except RegistryError as error:
+        if error.category != "unsupported_rollout":
+            raise
+        message = ("V2 matrix requires Codex 0.157.1 or newer supported version"
+                   if matrix_variant == "v2" else "Matrix Codex version is invalid")
+        raise ValueError(message) from error
     entries = index["entries"]
     if not isinstance(entries, list) or len(entries) != len(ROLE_NAMES):
         raise ValueError("Matrix must have exactly nine entries")
@@ -252,6 +269,12 @@ def _validate_locked(
         rollout_variant = entry["rolloutVariant"] if matrix_variant == "v2" else "v1"
         if not isinstance(rollout_variant, str) or rollout_variant not in {"v1", "v2"}:
             raise ValueError("Matrix rollout variant is invalid")
+        try:
+            require_rollout_schema(policy, expected_version, rollout_variant)
+        except RegistryError as error:
+            if error.category != "unsupported_rollout":
+                raise
+            raise ValueError("Matrix rollout variant is invalid") from error
         role, capture_id = entry["role"], entry["captureId"]
         if not isinstance(role, str) or role not in ROLE_NAMES or role in seen_roles:
             raise ValueError("Matrix role is unknown or repeated")
@@ -266,7 +289,7 @@ def _validate_locked(
         sidecar_path = root / sidecar_name
         sidecar_bytes = _safe_file(sidecar_path, MAX_INPUT_BYTES)
         stable[sidecar_path] = (_sha256(sidecar_bytes), MAX_INPUT_BYTES)
-        bracket = validate_snapshot_sidecar(root, sidecar_path)
+        bracket = validate_snapshot_sidecar(root, sidecar_path, source_root=source_root, policy=policy)
         if bracket != {
             "status": "SNAPSHOT_BRACKET_VALID", "runId": marker["runId"],
             "captureId": capture_id, "role": role,
@@ -300,6 +323,7 @@ def _validate_locked(
             external["childRollout"], external["agentConfig"],
             review_bytes=external["compositeReview"], role=role,
             rollout_variant=rollout_variant,
+            source_root=source_root, policy=policy,
         )
         if (
             composite.get("status") != "ACCEPTED_ONE_ROLE"
@@ -357,8 +381,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--evidence-root", type=Path, required=True)
     arguments = parser.parse_args(argv)
     try:
+        source_root = Path(__file__).absolute().parent.parent
+        registry = load_registry(source_root)
+        require_source_root(registry, source_root)
         result = validate_l5_rollout_matrix(
-            arguments.run_root, arguments.index, arguments.evidence_root
+            arguments.run_root, arguments.index, arguments.evidence_root,
+            source_root=source_root, policy=registry,
         )
         print(json.dumps(result, sort_keys=True))
         return 0

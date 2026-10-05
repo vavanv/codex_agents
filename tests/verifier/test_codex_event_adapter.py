@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import sys
 import unittest
+import tempfile
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -10,6 +12,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 
 import codex_event_adapter as adapter
+import codex_compatibility as compatibility
 
 
 PARENT = "00000000-0000-4000-8000-000000000001"
@@ -474,12 +477,68 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual((), result.reason_codes)
         self.assertTrue(result.sanitized)
 
+    def test_independent_capture_matrix(self) -> None:
+        raw = adapter.sanitize_event_stream(complete_stream())
+        for version, accepted in {"0.155.1": True, "0.157.1": True, "0.159.0": True,
+                                  "0.159.3": True, "0.160.0": False}.items():
+            with self.subTest(version=version):
+                result = adapter.validate_captured_fixture(raw, self.manifest(raw, version))
+                self.assertEqual(accepted, result.conformance == "schema-conformant")
+                self.assertEqual(not accepted, "FIXTURE_VERSION_MISMATCH" in result.reason_codes)
+
+    def test_registry_gate_and_fabricated_registration_control_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "compatibility").mkdir()
+            path = root / "compatibility/codex-agents.json"
+            document = json.loads((REPOSITORY_ROOT / "compatibility/codex-agents.json").read_bytes())
+            document["versions"]["0.155.1"]["gates"]["capturedEvidence"] = False
+            document["versions"]["0.155.1"]["rolloutSchemas"] = []
+            document["versions"]["999.4.2"] = document["versions"]["0.160.0"]
+            path.write_text(json.dumps(document), encoding="utf-8")
+            raw = adapter.sanitize_event_stream(complete_stream())
+            for version in ("0.155.1", "999.4.2"):
+                result = adapter.validate_captured_fixture(raw, self.manifest(raw, version), source_root=root)
+                self.assertIn("FIXTURE_VERSION_MISMATCH", result.reason_codes)
+
+    def test_bound_snapshot_reused_and_foreign_default_rejected_before_parsing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "compatibility").mkdir()
+            path = root / "compatibility/codex-agents.json"
+            path.write_bytes((REPOSITORY_ROOT / "compatibility/codex-agents.json").read_bytes())
+            registry = compatibility.load_registry(root)
+            path.write_bytes(b"changed after snapshot")
+            raw = adapter.sanitize_event_stream(complete_stream())
+            with patch.object(adapter, "load_registry", side_effect=AssertionError("snapshot reloaded")):
+                result = adapter.validate_captured_fixture(raw, self.manifest(raw), source_root=root, policy=registry)
+            self.assertEqual("schema-conformant", result.conformance)
+            with patch.object(adapter, "parse_event_stream", side_effect=AssertionError("foreign policy parsed evidence")):
+                with self.assertRaises(compatibility.RegistryError) as caught:
+                    adapter.validate_captured_fixture(raw, self.manifest(raw), policy=registry)
+            self.assertEqual("source_mismatch", caught.exception.category)
+            for value in (b"invalid", b'{"schemaVersion":1,"schemaVersion":1}', None):
+                if value is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(value)
+                with patch.object(adapter, "parse_event_stream", side_effect=AssertionError("invalid policy parsed evidence")):
+                    with self.assertRaises(compatibility.RegistryError):
+                        adapter.validate_captured_fixture(raw, self.manifest(raw), source_root=root)
+
+    def test_parser_and_manifest_builder_do_not_load_policy(self) -> None:
+        with patch.object(adapter, "load_registry", side_effect=AssertionError("pure adapter loaded policy")):
+            adapter.capture_fixture_manifest("synthetic", "999.0.0", complete_stream())
+            adapter.parse_event_stream(complete_stream())
+
     def test_new_version_synthetic_fixture_uses_same_fail_closed_schema(self) -> None:
         raw = complete_stream()
-        manifest = self.manifest(raw, codex_version="0.159.0")
-        result = adapter.validate_captured_fixture(adapter.sanitize_event_stream(raw), manifest)
-        self.assertEqual("schema-conformant", result.conformance)
-        self.assertEqual((), result.reason_codes)
+        for version in ("0.159.0", "0.159.3"):
+            with self.subTest(version=version):
+                manifest = self.manifest(raw, codex_version=version)
+                result = adapter.validate_captured_fixture(adapter.sanitize_event_stream(raw), manifest)
+                self.assertEqual("schema-conformant", result.conformance)
+                self.assertEqual((), result.reason_codes)
 
     def test_hash_and_version_mismatch_are_rejected(self) -> None:
         raw = complete_stream()
@@ -593,4 +652,3 @@ class FixtureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -83,6 +83,24 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertEqual("FAIL", by_role[role].verdict)
         self.assertIn("EFFORT_MISMATCH", by_role[role].reason_codes)
 
+    def test_known_model_mismatch_fails_when_effort_is_missing(self) -> None:
+        role = "code_explorer"
+        attribution = adapter.parse_event_stream(build_stream(
+            self.configured, {role: {"model": "wrong-model", "effort": None}}))
+        verdict = next(item for item in routing.evaluate_model_routing(self.configured, attribution)
+                       if item.role == role)
+        self.assertEqual("FAIL", verdict.verdict)
+        self.assertEqual(("MISSING_OBSERVED_EFFORT", "MODEL_MISMATCH"), verdict.reason_codes)
+
+    def test_known_effort_mismatch_fails_when_model_is_missing(self) -> None:
+        role = "implementer"
+        attribution = adapter.parse_event_stream(build_stream(
+            self.configured, {role: {"model": None, "effort": "low"}}))
+        verdict = next(item for item in routing.evaluate_model_routing(self.configured, attribution)
+                       if item.role == role)
+        self.assertEqual("FAIL", verdict.verdict)
+        self.assertEqual(("EFFORT_MISMATCH", "MISSING_OBSERVED_MODEL"), verdict.reason_codes)
+
     def test_missing_observed_metadata_is_unverified(self) -> None:
         overrides = {role: {"model": None, "effort": None} for role in EXPECTED_ROLES}
         attribution = adapter.parse_event_stream(build_stream(self.configured, overrides))

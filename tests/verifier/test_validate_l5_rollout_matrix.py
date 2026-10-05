@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 from io import StringIO
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -19,6 +20,11 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 import capture_live_event as capture_module
 import live_validation_support as live
 import validate_l5_rollout_matrix as matrix
+import validate_capture_snapshot as snapshot_validator
+import validate_composite_fixture as composite_validator
+import codex_event_adapter as adapter
+import reconcile_codex_rollouts as reconciliation
+import codex_compatibility as compatibility
 from tests.verifier.test_reconcile_codex_rollouts import encoded, fixture, role_config, v2_fixture
 from tests.verifier.test_validate_composite_fixture import assess, attestation
 
@@ -73,7 +79,7 @@ class L5RolloutMatrixTests(unittest.TestCase):
                 capture_id = sidecar["captureId"]
                 capture = (cls.root / sidecar["files"]["capture"]["path"]).read_bytes()
                 manifest = (cls.root / sidecar["files"]["manifest"]["path"]).read_bytes()
-                _, _, parent, child = fixture(role, version="0.159.0")
+                _, _, parent, child = fixture(role, version="0.159.3")
                 original_parent = session_id(1)
                 original_child = session_id(2)
                 parent_bytes = encoded(parent).replace(original_parent.encode(), parents[role].encode())
@@ -146,7 +152,7 @@ class L5RolloutMatrixTests(unittest.TestCase):
         self.index = {
             "schema": matrix.SCHEMA,
             "runId": self.run_id,
-            "codexVersion": "0.159.0",
+            "codexVersion": "0.159.3",
             "entries": copy.deepcopy(self.entries),
         }
         self.write_index()
@@ -244,7 +250,7 @@ class L5RolloutMatrixTests(unittest.TestCase):
             self.assertEqual({
                 "status": "ROLLOUT_MATRIX_CORRELATED",
                 "roleCount": 9,
-                "codexVersion": "0.159.0",
+                "codexVersion": "0.159.3",
                 "rolloutSource": "persistent-rollouts",
                 "publicStreamAttribution": "MISSING_ATTRIBUTION",
                 "l5Accepted": False,
@@ -317,7 +323,7 @@ class L5RolloutMatrixTests(unittest.TestCase):
         self.assertEqual({
             "status": "ROLLOUT_MATRIX_CORRELATED",
             "roleCount": 9,
-            "codexVersion": "0.159.0",
+            "codexVersion": "0.159.3",
             "rolloutSource": "persistent-rollouts",
             "publicStreamAttribution": "MISSING_ATTRIBUTION",
             "l5Accepted": False,
@@ -489,8 +495,8 @@ class L5RolloutMatrixTests(unittest.TestCase):
         original = sidecar_path.read_bytes()
         original_validator = matrix.validate_snapshot_sidecar
 
-        def swap_after_validation(root: Path, path: Path) -> dict:
-            result = original_validator(root, path)
+        def swap_after_validation(root: Path, path: Path, **kwargs: object) -> dict:
+            result = original_validator(root, path, **kwargs)
             if path == sidecar_path:
                 sidecar_path.write_bytes(b'{"files":null}')
             return result
@@ -537,6 +543,77 @@ class L5RolloutMatrixTests(unittest.TestCase):
             "l5Accepted": False,
             "runtimeValidated": False,
         }, json.loads(output.getvalue()))
+
+
+    def test_all_nested_consumers_reuse_snapshot_and_source_after_policy_byte_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            (source / "compatibility").mkdir()
+            path = source / "compatibility/codex-agents.json"
+            path.write_bytes((REPOSITORY_ROOT / "compatibility/codex-agents.json").read_bytes())
+            registry = compatibility.load_registry(source)
+            path.write_bytes(b"changed after snapshot")
+            prior = Path.cwd()
+            os.chdir(directory)
+            try:
+                with ExitStack() as stack:
+                    for module in (matrix, snapshot_validator, composite_validator, adapter, reconciliation):
+                        stack.enter_context(patch.object(module, "load_registry", side_effect=AssertionError("nested policy reload")))
+                    bracket = stack.enter_context(patch.object(matrix, "validate_snapshot_sidecar", wraps=matrix.validate_snapshot_sidecar))
+                    composite = stack.enter_context(patch.object(matrix, "validate_composite_fixture", wraps=matrix.validate_composite_fixture))
+                    result = matrix.validate_l5_rollout_matrix(self.root, self.index_path, self.evidence_root,
+                                                               source_root=source, policy=registry)
+            finally:
+                os.chdir(prior)
+            self.assertEqual("ROLLOUT_MATRIX_CORRELATED", result["status"])
+            for nested in (bracket, composite):
+                self.assertEqual(9, nested.call_count)
+                for call in nested.call_args_list:
+                    self.assertIs(registry, call.kwargs["policy"])
+                    self.assertEqual(source, call.kwargs["source_root"])
+
+    def test_registry_capture_and_schema_gates_fail_before_nested_evidence(self) -> None:
+        with patch.object(matrix, "validate_snapshot_sidecar", side_effect=AssertionError("denied version read sidecar")):
+            self.index["codexVersion"] = "0.160.0"
+            self.write_index()
+            with self.assertRaisesRegex(ValueError, "Matrix Codex version is invalid"):
+                matrix.validate_l5_rollout_matrix(self.root, self.index_path, self.evidence_root)
+        self.index["codexVersion"] = "0.159.3"
+        self.write_index()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            (source / "compatibility").mkdir()
+            document = json.loads((REPOSITORY_ROOT / "compatibility/codex-agents.json").read_bytes())
+            document["versions"]["0.159.3"]["rolloutSchemas"] = ["v2"]
+            (source / "compatibility/codex-agents.json").write_text(json.dumps(document), encoding="utf-8")
+            with patch.object(matrix, "validate_snapshot_sidecar", side_effect=AssertionError("denied schema read sidecar")):
+                with self.assertRaisesRegex(ValueError, "Matrix Codex version is invalid"):
+                    matrix.validate_l5_rollout_matrix(self.root, self.index_path, self.evidence_root, source_root=source)
+
+    def test_invalid_foreign_missing_policy_fails_before_matrix_file_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            (source / "compatibility").mkdir()
+            path = source / "compatibility/codex-agents.json"
+            path.write_bytes((REPOSITORY_ROOT / "compatibility/codex-agents.json").read_bytes())
+            registry = compatibility.load_registry(source)
+            with patch.object(matrix, "_safe_file", side_effect=AssertionError("foreign policy read matrix")):
+                with self.assertRaises(compatibility.RegistryError):
+                    matrix.validate_l5_rollout_matrix(self.root, self.index_path, self.evidence_root, policy=registry)
+            for value in (b"bad JSON", b'{"schemaVersion":1,"schemaVersion":1}', None):
+                if value is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(value)
+                with patch.object(matrix, "_safe_file", side_effect=AssertionError("invalid policy read matrix")):
+                    with self.assertRaises(compatibility.RegistryError):
+                        matrix.validate_l5_rollout_matrix(self.root, self.index_path, self.evidence_root, source_root=source)
+        with patch.object(matrix, "load_registry", side_effect=compatibility.RegistryError("malformed_policy", "bad")), \
+             patch.object(matrix, "validate_l5_rollout_matrix", side_effect=AssertionError("CLI read matrix")), \
+             redirect_stdout(StringIO()) as output:
+            self.assertEqual(2, matrix.main(["--run-root", str(self.root), "--index", str(self.index_path),
+                                            "--evidence-root", str(self.evidence_root)]))
+        self.assertEqual("ROLLOUT_MATRIX_INVALID", json.loads(output.getvalue())["status"])
 
 
 if __name__ == "__main__":

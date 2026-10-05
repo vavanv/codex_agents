@@ -4,6 +4,7 @@ from contextlib import contextmanager, redirect_stdout
 import hashlib
 from io import StringIO
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,7 @@ import unittest
 import uuid
 from pathlib import Path
 from unittest.mock import patch
+from types import SimpleNamespace
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -21,6 +23,7 @@ import capture_live_event as capture_module
 import codex_event_adapter as adapter
 import live_validation_support as live
 import validate_capture_snapshot as snapshot_validator
+import codex_compatibility as compatibility
 
 
 class OwnedSnapshotCaptureTests(unittest.TestCase):
@@ -118,6 +121,69 @@ class OwnedSnapshotCaptureTests(unittest.TestCase):
         )
         self.assertTrue((self.root / "results" / "private" / value["captureId"]).is_dir())
         self.assertFalse((self.root / "results" / "capture.lock").exists())
+
+    def test_independent_capture_gate_matrix_preserves_manifest_name_identity(self) -> None:
+        self.capture()
+        for version, accepted in {"0.155.1": True, "0.157.1": True, "0.159.0": True,
+                                  "0.159.3": True, "0.160.0": False}.items():
+            with self.subTest(version=version):
+                self.rewrite_manifest("codexVersion", version)
+                sidecar = self.rewrite_manifest("name", f"windows-{version}-code_explorer-capture")
+                if accepted:
+                    self.assertEqual("SNAPSHOT_BRACKET_VALID", snapshot_validator.validate_snapshot_sidecar(self.root, sidecar)["status"])
+                else:
+                    with self.assertRaisesRegex(ValueError, "Manifest capture state"):
+                        snapshot_validator.validate_snapshot_sidecar(self.root, sidecar)
+
+    def test_policy_failure_precedes_owned_fixture_reads_and_cli_keeps_failure_envelope(self) -> None:
+        source = Path(self.temporary.name) / "policy-source"
+        (source / "compatibility").mkdir(parents=True)
+        path = source / "compatibility/codex-agents.json"
+        path.write_bytes((REPOSITORY_ROOT / "compatibility/codex-agents.json").read_bytes())
+        registry = compatibility.load_registry(source)
+        with patch.object(snapshot_validator, "validate_marker", side_effect=AssertionError("foreign policy read fixture")):
+            with self.assertRaises(compatibility.RegistryError):
+                snapshot_validator.validate_snapshot_sidecar(self.root, self.root / "missing", policy=registry)
+            for value in (b"corrupt", b'{"schemaVersion":1,"schemaVersion":1}', None):
+                if value is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(value)
+                with self.assertRaises(compatibility.RegistryError):
+                    snapshot_validator.validate_snapshot_sidecar(self.root, self.root / "missing", source_root=source)
+        original_lstat = Path.lstat
+        path.write_bytes(b"still regular")
+        def unsafe(path, *args, **kwargs):
+            metadata = original_lstat(path, *args, **kwargs)
+            if path == source:
+                return SimpleNamespace(st_mode=metadata.st_mode, st_file_attributes=0x400)
+            return metadata
+        with patch.object(Path, "lstat", unsafe), \
+             patch.object(snapshot_validator, "validate_marker", side_effect=AssertionError("unsafe policy read fixture")):
+            with self.assertRaises(compatibility.RegistryError):
+                snapshot_validator.validate_snapshot_sidecar(self.root, self.root / "missing", source_root=source, policy=registry)
+        with patch.object(snapshot_validator, "load_registry", side_effect=compatibility.RegistryError("malformed_policy", "bad")), \
+             patch.object(snapshot_validator, "validate_snapshot_sidecar", side_effect=AssertionError("CLI read evidence")), \
+             redirect_stdout(StringIO()) as output:
+            self.assertEqual(2, snapshot_validator.main(["--run-root", str(self.root), "--sidecar", "missing"]))
+        self.assertEqual("SNAPSHOT_BRACKET_INVALID", json.loads(output.getvalue())["status"])
+
+    def test_same_snapshot_reused_after_byte_change_from_unrelated_cwd(self) -> None:
+        self.capture()
+        source = Path(self.temporary.name) / "policy-source"
+        (source / "compatibility").mkdir(parents=True)
+        path = source / "compatibility/codex-agents.json"
+        path.write_bytes((REPOSITORY_ROOT / "compatibility/codex-agents.json").read_bytes())
+        registry = compatibility.load_registry(source)
+        path.write_bytes(b"changed after immutable snapshot")
+        prior = Path.cwd()
+        os.chdir(self.temporary.name)
+        try:
+            with patch.object(snapshot_validator, "load_registry", side_effect=AssertionError("snapshot reloaded")):
+                result = snapshot_validator.validate_snapshot_sidecar(self.root, self.sidecar(), source_root=source, policy=registry)
+        finally:
+            os.chdir(prior)
+        self.assertEqual("SNAPSHOT_BRACKET_VALID", result["status"])
 
     def test_timeout_still_has_after_snapshot_but_is_not_accepted(self) -> None:
         code, output = self.capture(timeout=True)

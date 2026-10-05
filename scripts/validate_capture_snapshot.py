@@ -11,6 +11,7 @@ import re
 
 from capture_live_event import ROLE_NAMES
 from codex_event_adapter import EVENT_SCHEMA, sanitize_event_stream
+from codex_compatibility import CompatibilityRegistry, RegistryError, load_registry, require_gate, require_source_root
 from live_validation_support import (
     LiveValidationError,
     SNAPSHOT_SCHEMA,
@@ -64,7 +65,13 @@ def _utc(value: object) -> datetime:
     return parsed
 
 
-def validate_snapshot_sidecar(run_root: Path, sidecar_path: Path) -> dict[str, object]:
+def validate_snapshot_sidecar(
+    run_root: Path, sidecar_path: Path, *, source_root: Path | None = None,
+    policy: CompatibilityRegistry | None = None,
+) -> dict[str, object]:
+    trusted_root = source_root if source_root is not None else Path(__file__).absolute().parent.parent
+    registry = policy if policy is not None else load_registry(trusted_root)
+    require_source_root(registry, trusted_root)
     root, marker = validate_marker(run_root)
     if marker["lifecycle"] != "ready" or marker["activeWorkers"]:
         raise ValueError("Owned fixture is not finalized and ready")
@@ -137,10 +144,15 @@ def validate_snapshot_sidecar(run_root: Path, sidecar_path: Path) -> dict[str, o
     }
     if set(manifest) != manifest_keys:
         raise ValueError("Manifest schema is invalid")
+    try:
+        require_gate(registry, manifest.get("codexVersion"), "capturedEvidence")
+    except RegistryError as error:
+        if error.category not in {"unknown_version", "denied_gate"}:
+            raise
+        raise ValueError("Manifest capture state is invalid") from error
     if (
         manifest["schema"] != "codex-live-fixture-manifest/v1"
         or not isinstance(manifest.get("codexVersion"), str)
-        or manifest["codexVersion"] not in {"0.155.1", "0.157.1", "0.159.0"}
         or manifest["name"] != f"windows-{manifest['codexVersion']}-{role}-capture"
         or manifest["eventSchema"] != EVENT_SCHEMA
         or manifest["sanitized"] is not True
@@ -201,7 +213,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sidecar", type=Path, required=True)
     arguments = parser.parse_args(argv)
     try:
-        output = validate_snapshot_sidecar(arguments.run_root, arguments.sidecar)
+        source_root = Path(__file__).absolute().parent.parent
+        registry = load_registry(source_root)
+        require_source_root(registry, source_root)
+        output = validate_snapshot_sidecar(arguments.run_root, arguments.sidecar,
+                                           source_root=source_root, policy=registry)
         print(json.dumps(output, sort_keys=True))
         return 0
     except (OSError, ValueError, UnicodeError, json.JSONDecodeError, LiveValidationError):
