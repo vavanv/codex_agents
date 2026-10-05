@@ -140,6 +140,14 @@ Planning is required when any of these apply: more than two or three likely file
 
 The root is the single authoritative writer of `plans/ACTIVE_PLAN.md`, `plans/HANDOFF.md`, and any execution ledger. Architects and workers return proposed state changes in their result packets. The root checks proposal consistency, updates files, and records why a proposal was rejected or modified.
 
+When a project has the optional `.codex-workflow/timeline/timeline_cli.py`, the
+root may explicitly record requested stage/turn start and finish events. Its
+ledger is user data under `.codex-workflow-data/timeline/`. This manual ledger
+does not observe sessions automatically or promise a complete
+history. Keep summaries short and sanitized; never store raw prompts or hidden
+reasoning. Mark model, effort and usage unavailable unless a trusted runtime
+source supports the observed value.
+
 Task statuses are exactly `Not started`, `In progress`, `Blocked`, and `Complete`. A task moves to `Complete` only after every acceptance criterion has direct evidence. A blocked task records the blocker, attempted checks, required remediation, and one safe resume point.
 
 ## 6. Context and result packets

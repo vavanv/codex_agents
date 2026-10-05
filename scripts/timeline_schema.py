@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import json
+import math
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import uuid
@@ -86,7 +87,7 @@ class UsageMetrics:
             if not isinstance(cac, int) or isinstance(cac, bool) or cac < 0:
                 raise TimelineValidationError("cached_tokens must be a non-negative integer")
         if cost is not None:
-            if not isinstance(cost, (int, float)) or isinstance(cost, bool) or cost < 0.0:
+            if not isinstance(cost, (int, float)) or isinstance(cost, bool) or not math.isfinite(cost) or cost < 0.0:
                 raise TimelineValidationError("monetary_cost_usd must be a non-negative number")
             cost = float(cost)
 

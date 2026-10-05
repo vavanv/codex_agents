@@ -56,6 +56,7 @@ MANAGED_BLOCK = """<!-- hybrid-codex-workflow:start -->
 - Use `docs/ai/PROJECT_CONTEXT.md` for project-specific architecture, commands, and boundaries.
 - If `.codex/agents/*.toml` is present, use the named role definitions for delegation; treat their sandbox values as defaults subject to parent-session controls.
 - For non-trivial work, the root orchestrator exclusively owns `plans/ACTIVE_PLAN.md` and `plans/HANDOFF.md`.
+- When a task timeline is requested, use `.codex-workflow/timeline/timeline_cli.py` to record explicit stage and turn events in `.codex-workflow-data/timeline/`. Never paste full prompts or hidden reasoning into summaries.
 - Preserve unrelated changes, require observed validation evidence, and never infer commit or push authorization.
 <!-- hybrid-codex-workflow:end -->"""
 
@@ -69,6 +70,11 @@ PACKAGE_FILES = {
     "templates/ACTIVE_PLAN.md": f"{INSTALL_DIRECTORY}/templates/ACTIVE_PLAN.md",
     "templates/HANDOFF.md": f"{INSTALL_DIRECTORY}/templates/HANDOFF.md",
     "templates/TASK_TEMPLATE.md": f"{INSTALL_DIRECTORY}/templates/TASK_TEMPLATE.md",
+    "scripts/timeline_schema.py": f"{INSTALL_DIRECTORY}/timeline/timeline_schema.py",
+    "scripts/timeline_privacy.py": f"{INSTALL_DIRECTORY}/timeline/timeline_privacy.py",
+    "scripts/timeline_collector.py": f"{INSTALL_DIRECTORY}/timeline/timeline_collector.py",
+    "scripts/timeline_exporter.py": f"{INSTALL_DIRECTORY}/timeline/timeline_exporter.py",
+    "scripts/timeline_cli.py": f"{INSTALL_DIRECTORY}/timeline/timeline_cli.py",
 }
 
 PROJECT_TEMPLATE_FILES = {
@@ -1046,6 +1052,7 @@ def _read_state(
         INSTALL_DIRECTORY,
         f"{INSTALL_DIRECTORY}/rules",
         f"{INSTALL_DIRECTORY}/templates",
+        f"{INSTALL_DIRECTORY}/timeline",
         "docs",
         "docs/ai",
         "plans",
@@ -2278,6 +2285,7 @@ def _install_with_adapter(
         INSTALL_DIRECTORY,
         f"{INSTALL_DIRECTORY}/rules",
         f"{INSTALL_DIRECTORY}/templates",
+        f"{INSTALL_DIRECTORY}/timeline",
         "docs",
         "docs/ai",
         "plans",
@@ -2522,6 +2530,7 @@ def _remove_empty_managed_directories(
     candidates = {
         f"{INSTALL_DIRECTORY}/rules",
         f"{INSTALL_DIRECTORY}/templates",
+        f"{INSTALL_DIRECTORY}/timeline",
         INSTALL_DIRECTORY,
         "docs/ai",
         "plans",

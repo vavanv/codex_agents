@@ -272,9 +272,39 @@ codex --cd "/path/to/your-project"
     ACTIVE_PLAN.md
     HANDOFF.md
     TASK_TEMPLATE.md
+  timeline/
+    timeline_cli.py
+    timeline_collector.py
+    timeline_exporter.py
+    timeline_privacy.py
+    timeline_schema.py
 ```
 
 Считайте эти файлы управляемыми пакетом. Проектные данные должны находиться в `docs/ai/` и `plans/`, а не в `.codex-workflow/`.
+
+### Необязательная временная шкала выполнения
+
+Установщик включает явную запись временной шкалы. Она не отслеживает сеансы
+Codex автоматически. Начните и завершите ход вручную, затем просмотрите или
+экспортируйте журнал задачи:
+
+```powershell
+python .\.codex-workflow\timeline\timeline_cli.py start --task-id <task-id> --stage IMPLEMENTATION --agent-role root --summary "Реализовать проверку запроса"
+python .\.codex-workflow\timeline\timeline_cli.py finish --task-id <task-id> --turn-id 0 --status SUCCESS --summary "Реализация и проверка завершены"
+python .\.codex-workflow\timeline\timeline_cli.py show --task-id <task-id>
+python .\.codex-workflow\timeline\timeline_cli.py show --task-id <task-id> --format json --output timeline.json
+```
+
+Если команда запускается вне каталога проекта, укажите `--project <path>`
+перед подкомандой. Команда `start` выводит идентификатор хода для `finish`.
+Записи хранятся в `.codex-workflow-data/timeline/<task-id>.jsonl`; представления
+Markdown, JSON и CSV можно создать повторно. Указывайте модель и метрики только
+при наличии доверенного источника; иначе значения остаются недоступными.
+Добавляйте только короткие очищенные сводки. Не включайте полные запросы,
+скрытые рассуждения, учетные данные, токены или приватный текст журналов.
+Очистка распознает распространенные секреты, но не все возможные секреты и
+фрагменты запросов. Явная запись не обеспечивает автоматический сбор или
+полную историю.
 
 ### `.codex/agents/` (подключается явно)
 

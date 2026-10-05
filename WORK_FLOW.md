@@ -272,9 +272,38 @@ This directory contains installer-owned copies:
     ACTIVE_PLAN.md
     HANDOFF.md
     TASK_TEMPLATE.md
+  timeline/
+    timeline_cli.py
+    timeline_collector.py
+    timeline_exporter.py
+    timeline_privacy.py
+    timeline_schema.py
 ```
 
 Treat these as package-managed files. Put project-specific information in `docs/ai/` and `plans/`, not in `.codex-workflow/`.
+
+### Optional execution timeline
+
+The installer includes an explicit timeline recorder. It does not observe
+Codex sessions automatically. Start and finish a turn around the stage you
+want to record, then inspect or export the task ledger:
+
+```powershell
+python .\.codex-workflow\timeline\timeline_cli.py start --task-id <task-id> --stage IMPLEMENTATION --agent-role root --summary "Implement request validation"
+python .\.codex-workflow\timeline\timeline_cli.py finish --task-id <task-id> --turn-id 0 --status SUCCESS --summary "Validation and implementation completed"
+python .\.codex-workflow\timeline\timeline_cli.py show --task-id <task-id>
+python .\.codex-workflow\timeline\timeline_cli.py show --task-id <task-id> --format json --output timeline.json
+```
+
+Use `--project <path>` before the subcommand when running outside the project
+directory. The start command prints the turn ID to pass to finish. Records are
+stored in `.codex-workflow-data/timeline/<task-id>.jsonl`; the Markdown, JSON and CSV
+views can be regenerated. Omit observed model and usage fields unless directly
+supported by a trusted source; absent values remain unavailable. Enter only
+short sanitized summaries. Never include full prompts, hidden reasoning,
+credentials, tokens or private rollout text. The redactor handles common
+secret patterns but cannot identify every secret or remove all prompt content.
+This explicit recorder makes no automatic-capture or complete-history claim.
 
 ### `.codex/agents/` (opt-in)
 

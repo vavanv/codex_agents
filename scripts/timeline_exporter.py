@@ -41,48 +41,52 @@ class TimelineExporter:
         return cls(events, task_id=task_id)
 
     def calculate_total_usage(self) -> UsageMetrics:
-        """Aggregate token counts and monetary costs across all completed turns."""
-        total_inp = 0
-        total_out = 0
-        total_cac = 0
-        total_cost = 0.0
-        has_usage = False
-
-        for ev in self.events:
-            if ev.usage:
-                has_usage = True
-                if ev.usage.input_tokens:
-                    total_inp += ev.usage.input_tokens
-                if ev.usage.output_tokens:
-                    total_out += ev.usage.output_tokens
-                if ev.usage.cached_tokens:
-                    total_cac += ev.usage.cached_tokens
-                if ev.usage.monetary_cost_usd:
-                    total_cost += ev.usage.monetary_cost_usd
-
-        if not has_usage:
+        """Aggregate observed metrics once per turn; incomplete totals stay unavailable."""
+        latest = self._latest_by_turn()
+        if not latest:
             return UsageMetrics()
+        fields = ("input_tokens", "output_tokens", "cached_tokens", "monetary_cost_usd")
+        totals: dict[str, Any] = {}
+        for field in fields:
+            values = [getattr(ev.usage, field) if ev.usage else None for ev in latest.values()]
+            if any(value is None for value in values):
+                totals[field] = None
+            else:
+                total = sum(values)
+                totals[field] = round(total, 6) if field == "monetary_cost_usd" else total
+        return UsageMetrics(**totals)
 
-        return UsageMetrics(
-            input_tokens=total_inp,
-            output_tokens=total_out,
-            cached_tokens=total_cac,
-            monetary_cost_usd=round(total_cost, 6),
-        )
+    def calculate_total_duration_ms(self) -> Optional[int]:
+        """Compute elapsed duration when every recorded turn has an observed duration."""
+        latest = list(self._latest_by_turn().values())
+        if not latest or any(ev.duration_ms is None for ev in latest):
+            return None
+        return sum(ev.duration_ms for ev in latest if ev.duration_ms is not None)
 
-    def calculate_total_duration_ms(self) -> int:
-        """Compute total elapsed execution duration in milliseconds."""
-        return sum(ev.duration_ms or 0 for ev in self.events)
+    def _latest_by_turn(self) -> dict[int, TimelineEvent]:
+        latest: dict[int, TimelineEvent] = {}
+        for ev in self.events:
+            latest[ev.turn_id] = ev
+        return latest
 
     def has_coverage_gaps(self) -> bool:
         """Check if any turn has unobserved models/efforts or aborted/incomplete statuses."""
-        for ev in self.events:
+        for ev in self._latest_by_turn().values():
+            if ev.status in {"STARTED", "RUNNING"}:
+                return True
             if ev.model_observed in {"unavailable", "unverified"} or ev.effort_observed in {
                 "unavailable",
                 "unverified",
             }:
                 return True
             if ev.status in {"ABORTED", "TIMEOUT", "CANCELLED", "FAILURE"}:
+                return True
+            if not ev.usage or any(
+                getattr(ev.usage, field) is None
+                for field in ("input_tokens", "output_tokens", "cached_tokens", "monetary_cost_usd")
+            ):
+                return True
+            if ev.duration_ms is None:
                 return True
         return False
 
@@ -92,20 +96,19 @@ class TimelineExporter:
         lines.append(f"# Task Execution Timeline: `{self.task_id}`\n")
 
         total_ms = self.calculate_total_duration_ms()
-        duration_s = round(total_ms / 1000.0, 2)
+        duration_label = f"{round(total_ms / 1000.0, 2)}s ({total_ms} ms)" if total_ms is not None else "Unavailable"
         usage = self.calculate_total_usage()
 
         # Metrics Summary Card
         lines.append("## Executive Metrics\n")
-        lines.append(f"- **Total Duration:** {duration_s}s ({total_ms} ms)")
-        lines.append(f"- **Total Turns Recorded:** {len(self.events)}")
-        if usage.input_tokens is not None or usage.output_tokens is not None:
-            inp = usage.input_tokens or 0
-            out = usage.output_tokens or 0
-            cac = usage.cached_tokens or 0
-            cost_str = f" (${usage.monetary_cost_usd:.4f})" if usage.monetary_cost_usd else ""
+        lines.append(f"- **Total Duration:** {duration_label}")
+        lines.append(f"- **Total Turns Recorded:** {len({ev.turn_id for ev in self.events})}")
+        if usage.input_tokens is not None and usage.output_tokens is not None:
+            cost_str = f" (${usage.monetary_cost_usd:.4f})" if usage.monetary_cost_usd is not None else ""
+            cached_str = f", {usage.cached_tokens:,} cached" if usage.cached_tokens is not None else ""
             lines.append(
-                f"- **Token Usage:** {inp + out:,} total ({inp:,} input, {out:,} output, {cac:,} cached){cost_str}"
+                f"- **Token Usage:** {usage.input_tokens + usage.output_tokens:,} total "
+                f"({usage.input_tokens:,} input, {usage.output_tokens:,} output{cached_str}){cost_str}"
             )
         else:
             lines.append("- **Token Usage:** *Unavailable from runtime stream*")
@@ -115,7 +118,7 @@ class TimelineExporter:
         if self.has_coverage_gaps():
             lines.append("> [!WARNING]")
             lines.append(
-                "> **Partial Observability Detected:** One or more execution turns had unobserved model/effort settings, failures, or were interrupted. Observed metrics reflect recorded data only.\n"
+                "> **Partial Observability Detected:** One or more turns are incomplete, failed, or missing observed model, effort, or usage data. Totals reflect only metrics available for every recorded turn.\n"
             )
 
         # Mermaid Sequence Diagram
@@ -140,7 +143,8 @@ class TimelineExporter:
                 lines.append(f'    {caller}->>{target}: [{ev.stage}] {sanitized_msg}')
                 if ev.status != "STARTED":
                     status_flag = "✓" if ev.status == "SUCCESS" else "✗"
-                    lines.append(f'    {target}-->>{caller}: {status_flag} {ev.status} ({ev.duration_ms or 0}ms)')
+                    duration = f"{ev.duration_ms}ms" if ev.duration_ms is not None else "duration unavailable"
+                    lines.append(f'    {target}-->>{caller}: {status_flag} {ev.status} ({duration})')
 
             lines.append("```\n")
 
@@ -162,7 +166,8 @@ class TimelineExporter:
                 else "*unavailable*"
             )
             token_str = (
-                f"{ev.usage.input_tokens or 0:,} / {ev.usage.output_tokens or 0:,}"
+                f"{ev.usage.input_tokens if ev.usage.input_tokens is not None else '—'} / "
+                f"{ev.usage.output_tokens if ev.usage.output_tokens is not None else '—'}"
                 if ev.usage
                 else "-"
             )
@@ -214,6 +219,7 @@ class TimelineExporter:
             "timestamp_start",
             "timestamp_end",
             "duration_ms",
+            "has_coverage_gaps",
             "input_tokens",
             "output_tokens",
             "cached_tokens",
@@ -226,7 +232,7 @@ class TimelineExporter:
             out_tok = ev.usage.output_tokens if ev.usage else ""
             cac = ev.usage.cached_tokens if ev.usage else ""
             cost = ev.usage.monetary_cost_usd if ev.usage else ""
-            writer.writerow([
+            row = [
                 ev.task_id,
                 ev.turn_id,
                 ev.stage,
@@ -240,14 +246,26 @@ class TimelineExporter:
                 ev.timestamp_start,
                 ev.timestamp_end or "",
                 ev.duration_ms if ev.duration_ms is not None else "",
+                self.has_coverage_gaps(),
                 inp,
                 out_tok,
                 cac,
                 cost,
                 ev.summary,
-            ])
+            ]
+            writer.writerow([self._spreadsheet_safe(value) for value in row])
 
         return out.getvalue()
+
+    @staticmethod
+    def _spreadsheet_safe(value: Any) -> Any:
+        """Keep spreadsheet programs from treating user text as a formula."""
+        if not isinstance(value, str):
+            return value
+        stripped = value.lstrip(" \t\r\n")
+        if value.startswith(("\t", "\r", "\n")) or stripped.startswith(("=", "+", "-", "@")):
+            return "'" + value
+        return value
 
 
 def main() -> int:
@@ -292,4 +310,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     sys.exit(main())

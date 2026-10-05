@@ -6,6 +6,7 @@ Contract-first workflow for using Codex with bounded specialist agents. The inst
 
 - [WORK_FLOW.md](WORK_FLOW.md) â€” authoritative step-by-step installation, operation, update, recovery, validation, and uninstall guide.
 - [WORK_FLOW.ru.md](WORK_FLOW.ru.md) â€” Russian translation.
+- [Offline validation](docs/OFFLINE_VALIDATION.md) — repository-local static and synthetic checks while runtime provenance is blocked.
 - [CODEX_WORKFLOW.md](CODEX_WORKFLOW.md) â€” workflow contract.
 - [rules/](rules/) â€” routing, validation, escalation, and Git-safety rules.
 - [agents/](agents/) â€” nine opt-in custom-agent definitions.
@@ -110,6 +111,13 @@ The uninstaller preserves modified files, surrounding `AGENTS.md` instructions, 
 - `docs/ai/PROJECT_CONTEXT.md` and `plans/TASK_TEMPLATE.md` only when absent.
 - A state manifest and transactional backups when needed (legacy filenames retain `hybrid` for compatibility).
 - `.codex/agents/*.toml` only when the custom-agent option is selected.
+
+The package includes an explicit execution timeline recorder at
+`.codex-workflow/timeline/timeline_cli.py`. Use `start`, `finish`, and `show`
+to record and export selected task stages and turns. This is manual
+recordkeeping; it does not capture Codex sessions automatically. Keep
+summaries short and sanitized, and enter model or usage values only when
+verified. See the [timeline instructions](WORK_FLOW.md#optional-execution-timeline).
 
 Installation is project-scoped and idempotent. Existing unmanaged files are not silently replaced.
 

@@ -28,7 +28,7 @@ from timeline_schema import (
     validate_timeline_event_dict,
     validate_timeline_sequence,
 )
-from codex_event_adapter import sanitize_text
+from timeline_privacy import sanitize_summary
 
 
 def _utc_now_iso() -> str:
@@ -149,7 +149,7 @@ class TimelineCollector:
         """Construct, sanitize, validate, and append a discrete timeline event."""
         assigned_turn = self.get_next_turn_id() if turn_id is None else turn_id
         start_ts = timestamp_start or _utc_now_iso()
-        sanitized_summary = sanitize_text(summary, limit=500)
+        sanitized_summary = sanitize_summary(summary, limit=500)
 
         # Enforce observed model/effort fallbacks: never substitute configured as observed
         obs_model = model_observed if model_observed is not None else "unavailable"
@@ -182,6 +182,11 @@ class TimelineCollector:
         }
 
         event = validate_timeline_event_dict(event_dict)
+        # Reject invalid transitions and clock rollback before persistence,
+        # rather than discovering an unreadable sequence on the next command.
+        valid, errors = validate_timeline_sequence([*self.read_events(), event])
+        if not valid:
+            raise TimelineValidationError(f"Proposed timeline sequence is invalid: {errors}")
         self._append_event(event)
         return event
 
@@ -242,6 +247,25 @@ class TimelineCollector:
     ) -> TimelineEvent:
         """Complete an active turn, computing duration and attaching usage metrics."""
         turn_info = self._active_turns.pop(turn_id, None)
+        if turn_info is None:
+            # CLI callers start and finish turns in separate processes. Restore
+            # the latest persisted STARTED/RUNNING event for that turn.
+            for event in self.read_events():
+                if event.turn_id != turn_id:
+                    continue
+                if event.status in {"STARTED", "RUNNING"}:
+                    turn_info = {
+                        "stage": event.stage,
+                        "agent_role": event.agent_role,
+                        "start_ts": event.timestamp_start,
+                        "prompt_id": event.prompt_id,
+                        "parent_agent_role": event.parent_agent_role,
+                        "session_id": event.session_id,
+                        "model_configured": event.model_configured,
+                        "effort_configured": event.effort_configured,
+                    }
+                elif event.status in {"SUCCESS", "FAILURE", "CANCELLED", "TIMEOUT", "ABORTED"}:
+                    turn_info = None
         end_ts = _utc_now_iso()
 
         if turn_info:
